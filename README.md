@@ -23,7 +23,7 @@ Autonomous research agent for Claude Code. Reads research requests from Slack, t
 Options:
 - `--channel <id>` — Slack channel to listen on (default: self-DM)
 - `--interval <seconds>` — poll interval in seconds (default: 3)
-- `--no-idle` — disable autonomous research expansion
+- `--idle` — only respond to messages; do not expand research autonomously
 
 ## How it works
 

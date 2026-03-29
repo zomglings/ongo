@@ -3,7 +3,7 @@ name: ongo
 description: >-
   Autonomous research agent. Polls Slack for research requests, tracks findings
   in kendb, expands research when idle, and self-improves on a 24-hour cycle.
-args: "[--channel <channel_id>] [--interval <seconds>] [--no-idle]"
+args: "[--channel <channel_id>] [--interval <seconds>] [--idle]"
 ---
 
 # Ongo — Autonomous Research Agent
@@ -13,7 +13,7 @@ args: "[--channel <channel_id>] [--interval <seconds>] [--no-idle]"
 Parse these from args if provided:
 - `--channel <id>` — Slack channel ID to listen on (default: auto-discover self-DM)
 - `--interval <seconds>` — seconds to sleep between ticks (default: 3)
-- `--no-idle` — if set, do not expand research when idle; only respond to messages
+- `--idle` — if set, only respond to messages; do not expand research autonomously
 
 ## Startup
 
@@ -86,8 +86,7 @@ If `--channel` provided:
 clacks send -c "$CHANNEL" -m "_[ongo] Research agent active in $(pwd)_"
 ```
 
-Record the current timestamp as LAST_TS. Record the current time as LAST_SELF_IMPROVE_TIME and
-LAST_EXPANSION_TIME.
+Record the current timestamp as LAST_TS. Record the current time as LAST_SELF_IMPROVE_TIME.
 
 ## Main Loop
 
@@ -118,8 +117,7 @@ Repeat forever:
      - Process the message (see "Processing Messages" below)
      - Send your response via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`
 
-4. **If no new messages AND idle mode is on**: check if at least 5 minutes have passed since
-   LAST_EXPANSION_TIME. If so, run idle expansion (see below) and update LAST_EXPANSION_TIME.
+4. **If no new messages AND `--idle` is not set**: run auto-expansion (see below).
 
 5. **If 24 hours have passed since LAST_SELF_IMPROVE_TIME**, or the user asked for it:
    - Run the self-improvement cycle (see below)
@@ -149,7 +147,7 @@ Interpret all messages as natural language. The user might ask to:
 - **Trigger self-improvement** — run the self-improvement cycle (A, B, C, or all)
 - **Anything else** — use your judgment
 
-## Idle Expansion
+## Auto-Expansion
 
 1. Load exploration strategy and topics:
    ```bash
