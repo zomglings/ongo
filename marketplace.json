@@ -1,0 +1,11 @@
+{
+  "name": "ongo",
+  "plugins": [
+    {
+      "name": "ongo",
+      "source": "https://github.com/zomglings/ongo",
+      "version": "0.1.0",
+      "description": "Autonomous research agent — reads requests from Slack, tracks research in kendb, self-improves"
+    }
+  ]
+}

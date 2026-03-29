@@ -1,0 +1,9 @@
+{
+  "name": "ongo",
+  "version": "0.1.0",
+  "description": "Autonomous research agent — reads requests from Slack, tracks research in kendb, self-improves",
+  "author": { "name": "Neeraj Kashyap" },
+  "repository": "https://github.com/zomglings/ongo",
+  "license": "MIT",
+  "keywords": ["research", "slack", "ken", "autonomous"]
+}
