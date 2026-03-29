@@ -101,14 +101,14 @@ Repeat forever:
 
 ### Tick
 
-1. Poll Slack for new messages (output is a JSON object with a `messages` array):
+1. Poll Slack for new messages since LAST_TS (output is a JSON object with a `messages` array):
    ```bash
-   clacks read -c "$CHANNEL" --limit 5
+   clacks read -c "$CHANNEL" --after "$LAST_TS"
    ```
    If this fails (network error, auth expiry), log the error and continue to the next tick.
 
-2. Filter: only process messages where `ts > LAST_TS`, `bot_id` is null, and `text` does not start
-   with `_`. Sort filtered messages by `ts` ascending.
+2. Filter: only process messages where `bot_id` is null and `text` does not start with `_`.
+   Sort filtered messages by `ts` ascending.
 
 3. **If there are new messages**:
    - Send a single `_[ongo] Processing..._` to Slack
