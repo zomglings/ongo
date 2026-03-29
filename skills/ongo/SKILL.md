@@ -101,7 +101,7 @@ Repeat forever:
 
 ### Tick
 
-1. Poll Slack for new messages since LAST_TS (output is a JSON object with a `messages` array):
+1. Poll Slack for new messages after LAST_TS (output is a JSON object with a `messages` array):
    ```bash
    clacks read -c "$CHANNEL" --after "$LAST_TS"
    ```
