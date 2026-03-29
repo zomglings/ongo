@@ -222,7 +222,13 @@ Then:
 When you encounter missing features or bugs in the tools you use (ken, clacks, or any other tool
 adopted during research), you are encouraged to submit GitHub issues or pull requests against those
 projects. For example, if ken lacks a delete command and you need one, open an issue or PR on
-`zomglings/ken`. Track these contributions in kendb as `ongo-self-improvement` entries.
+`zomglings/ken`.
+
+Track each contribution in kendb as an `ongo-self-improvement` entry. Include the issue/PR URL as
+the key. Add notes to track the state: submitted, accepted, rejected, or closed. On subsequent
+self-improvement cycles, check the status of open contributions (`gh issue view`, `gh pr view`) and
+update their notes accordingly. If a contribution is rejected, record the reason — this informs
+whether to try a different approach or work around the limitation locally.
 
 **Constraints**: Do not remove shutdown commands, do not reduce the polling interval below 1 second,
 do not remove error handling, do not remove or weaken message deduplication (the `ts > LAST_TS`
