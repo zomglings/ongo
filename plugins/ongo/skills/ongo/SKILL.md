@@ -147,4 +147,4 @@ File issues/PRs against tools (ken, clacks, etc.) when you hit bugs or missing f
 ## Message Format
 
 - **Always** prepend `[ongo]` to every sent message — this is how the poll filter works. Omitting it causes an infinite loop.
-- Truncate over 30000 chars. Use `_..._` for status messages.
+- Truncate responses over 30000 chars. Use `_..._` for status messages.
