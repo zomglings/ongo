@@ -144,7 +144,7 @@ Interpret all messages as natural language. The user might ask to:
   notes), respond with a summary. If a ken command fails, log the error to Slack and continue.
 - **Manage kendb** — query with `ken list`, report results
 - **Update exploration strategy** — add/update `ongo-exploration` entries in kendb
-- **Trigger self-improvement** — run the self-improvement cycle (A, B, C, or all)
+- **Trigger self-improvement** — run any single layer (A, B, C, D, or E) or all of them
 - **Anything else** — use your judgment
 
 ## Auto-Expansion
@@ -167,7 +167,7 @@ Interpret all messages as natural language. The user might ask to:
 
 ## Self-Improvement
 
-Runs every 24 hours after startup, or when the user asks. Three layers, all run together:
+Runs every 24 hours after startup, or when the user asks. Five layers, all run together:
 
 ### A. kendb maintenance
 
@@ -194,7 +194,41 @@ pip index versions slack-clacks 2>/dev/null || uv pip index versions slack-clack
 ```
 If newer, upgrade. Report on Slack.
 
-### C. Self-modification
+### C. Upstream sync
+
+Fetch the latest SKILL.md from zomglings/ongo and merge upstream changes into the local copy,
+preserving local improvements.
+
+1. Download the upstream version:
+   ```bash
+   gh api repos/zomglings/ongo/contents/plugins/ongo/skills/ongo/SKILL.md --jq '.content' | base64 -d > ${CLAUDE_SKILL_DIR}/SKILL.md.upstream
+   ```
+2. Compare with the local version:
+   ```bash
+   diff ${CLAUDE_SKILL_DIR}/SKILL.md ${CLAUDE_SKILL_DIR}/SKILL.md.upstream
+   ```
+3. If there are no differences, clean up and skip to the next section:
+   ```bash
+   rm ${CLAUDE_SKILL_DIR}/SKILL.md.upstream
+   ```
+4. If there are differences, read both files carefully. Identify:
+   - **Upstream additions** — new sections, instructions, or fixes not present locally
+   - **Local improvements** — changes the agent made during self-modification cycles
+   - **Conflicts** — places where both upstream and local diverge on the same section
+5. Merge by applying upstream additions to the local file while keeping local improvements. When
+   in conflict, prefer the local version but note the upstream intent in a comment. Do NOT
+   overwrite the local file with the upstream file wholesale.
+6. Record the merge:
+   ```bash
+   ${CLAUDE_SKILL_DIR}/bin/ken add ongo-self-improvement -k "$(date +%s)-upstream-sync" --title "Merged upstream SKILL.md changes"
+   ```
+7. Report on Slack: `_[ongo] Synced upstream changes from zomglings/ongo_`
+8. Clean up:
+   ```bash
+   rm ${CLAUDE_SKILL_DIR}/SKILL.md.upstream
+   ```
+
+### D. Self-modification
 
 First, consult past self-improvement attempts to avoid repeating failures:
 ```bash
@@ -216,7 +250,7 @@ Then:
 5. Report on Slack: `_[ongo] Self-update: <what changed>_`
 6. If the next tick fails to parse the skill, restore from backup.
 
-### D. Upstream contributions
+### E. Upstream contributions
 
 When you encounter missing features or bugs in the tools you use (ken, clacks, or any other tool
 adopted during research), you are encouraged to submit GitHub issues or pull requests against those
