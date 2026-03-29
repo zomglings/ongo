@@ -167,7 +167,7 @@ Interpret all messages as natural language. The user might ask to:
 
 ## Self-Improvement
 
-Runs every 24 hours after startup, or when the user asks. Three layers, all run together:
+Runs every 24 hours after startup, or when the user asks. Five layers, all run together:
 
 ### A. kendb maintenance
 
