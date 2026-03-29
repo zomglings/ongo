@@ -125,7 +125,7 @@ Interpret as natural language. The user might ask to:
 
 4. Continue the main loop immediately — do NOT wait for the expansion agent to finish.
 
-**For processing user messages**: also prefer delegating heavyweight research requests to Opus subagents with the same self-contextualization pattern. Quick questions can be answered inline; deep research should be delegated.
+**For processing user messages**: also prefer delegating heavyweight research requests to subagents (using the most capable available model) with the same self-contextualization pattern. Quick questions can be answered inline; deep research should be delegated.
 
 ## Self-Improvement
 
