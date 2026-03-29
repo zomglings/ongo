@@ -21,13 +21,13 @@ Parse these from args if provided:
 
 **jq** (JSON processor):
 ```bash
-which jq
+command -v jq
 ```
 If not found, tell the user to install jq and halt startup.
 
 **clacks** (Slack CLI):
 ```bash
-which clacks
+command -v clacks
 ```
 If not found:
 ```bash
@@ -108,13 +108,14 @@ Repeat forever:
    If this fails (network error, auth expiry), log the error and continue to the next tick.
 
 2. Filter: only process messages where `ts > LAST_TS`, `bot_id` is null, and `text` does not start
-   with `_`.
+   with `_`. Sort filtered messages by `ts` ascending.
 
-3. **If there are new messages**, for each message:
-   - Update LAST_TS to this message's ts
-   - Send `_[ongo] Processing..._` to Slack
-   - Process the message (see "Processing Messages" below)
-   - Send your response via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`
+3. **If there are new messages**:
+   - Send a single `_[ongo] Processing..._` to Slack
+   - For each message (in ts order):
+     - Update LAST_TS to this message's ts
+     - Process the message (see "Processing Messages" below)
+     - Send your response via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`
 
 4. **If no new messages AND idle mode is on**: check if at least 5 minutes have passed since
    LAST_EXPANSION_TIME. If so, run idle expansion (see below) and update LAST_EXPANSION_TIME.
@@ -141,7 +142,7 @@ If a message contains `/quit`, `/stop`, or `/exit`:
 Interpret all messages as natural language. The user might ask to:
 
 - **Research something** — search the web, add findings to kendb (publications, relationships,
-  notes), respond with a summary
+  notes), respond with a summary. If a ken command fails, log the error to Slack and continue.
 - **Manage kendb** — query with `ken list`, report results
 - **Update exploration strategy** — add/update `ongo-exploration` entries in kendb
 - **Trigger self-improvement** — run the self-improvement cycle (A, B, C, or all)
@@ -172,7 +173,7 @@ Runs every 24 hours after startup, or when the user asks. Three layers, all run 
 ### A. kendb maintenance
 
 - **Dedup** publications by key/URL/arxiv ID
-- **Gap filling** — add implied relationships (A→B, B→C ⇒ A→C where sensible)
+- **Gap filling** — add implied relationships (A→B, B→C ⇒ A→C where sensible), limit to depth 1 and cap at 20 new relationships per cycle
 - **Surveys** — for topics with many publications, produce a summary note
 - **Importance** — estimate topic centrality by connection count
 - **Kind evolution** — add new `pubkind` if publications don't fit existing kinds
@@ -185,7 +186,8 @@ Check for new ken releases and compare with installed version:
 gh release list -R zomglings/ken --limit 1
 ${CLAUDE_SKILL_DIR}/bin/ken version
 ```
-If newer, download and replace the binary. Report on Slack.
+If newer, download and replace the binary using the same install procedure from Startup step 1.
+Report on Slack.
 
 Check for new clacks releases:
 ```bash
@@ -205,9 +207,15 @@ Then:
    ```bash
    ${CLAUDE_SKILL_DIR}/bin/ken add ongo-self-improvement -k "<timestamp>-<label>" --title "<what will change>"
    ```
-2. Reflect on recent cycles and make the change (e.g., edit `${CLAUDE_SKILL_DIR}/SKILL.md`).
-3. Record the outcome as a note on the publication.
-4. Report on Slack: `_[ongo] Self-update: <what changed>_`
+2. Back up the file before editing:
+   ```bash
+   cp ${CLAUDE_SKILL_DIR}/SKILL.md ${CLAUDE_SKILL_DIR}/SKILL.md.bak
+   ```
+3. Reflect on recent cycles and make the change. Only modify `${CLAUDE_SKILL_DIR}/SKILL.md` —
+   no other files.
+4. Record the outcome as a note on the publication.
+5. Report on Slack: `_[ongo] Self-update: <what changed>_`
+6. If the next tick fails to parse the skill, restore from backup.
 
 **Constraints**: Do not remove shutdown commands, do not reduce the polling interval below 1 second,
 do not remove error handling, do not remove or weaken message deduplication (the `ts > LAST_TS`
