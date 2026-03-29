@@ -11,7 +11,7 @@ Autonomous research agent for Claude Code. Reads research requests from Slack, t
 
 ```
 /plugin marketplace add zomglings/ongo
-/plugin install ongo@zomglings-ongo
+/plugin install ongo@ongo
 ```
 
 ## Usage
