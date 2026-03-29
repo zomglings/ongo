@@ -61,7 +61,7 @@ If CHANNEL is empty, halt. Set LAST_TS to now. Set LAST_SELF_IMPROVE_TIME to now
 
 ## Main Loop
 
-**IMPORTANT**: NOT a bash while-loop. Each tick is a discrete agent action. Every tick stays in context. If context limit approaches, send `_[ongo] Context limit approaching, shutting down._` and exit.
+**IMPORTANT**: NOT a bash while-loop. Each tick is a discrete agent action. Every tick stays in context. Do NOT preemptively shut down for context concerns — auto-compact handles this. Only shut down on explicit user command (`/quit`, `/stop`, `/exit`).
 
 ### Tick
 
@@ -87,14 +87,45 @@ Interpret as natural language. The user might ask to:
 
 ## Auto-Expansion
 
-1. Load strategy and topics:
+**Delegate to an intelligent subagent** using the most capable available model (opus at time of writing — check for newer models during self-improvement). The main loop stays lean — it only picks a topic and launches the agent. The subagent self-loads its own context from kendb.
+
+1. Load only the topic list and exploration directives (lightweight):
    ```bash
    ${CLAUDE_SKILL_DIR}/bin/ken list --kind ongo-exploration
    ${CLAUDE_SKILL_DIR}/bin/ken list --kind topic
    ```
 2. Pick a topic **randomly**, weighted by `ongo-exploration` directives. Skip if no topics.
-3. Research new related work, add findings to kendb with relationships.
-4. Report: `_[ongo] Expanded research on: <topic title>_`
+3. **Launch an Opus subagent** (via the Agent tool with `model: "opus"` and `run_in_background: true`) whose prompt contains only:
+   - The topic title and ID
+   - The ken binary path: `${CLAUDE_SKILL_DIR}/bin/ken`
+   - The clacks channel ID
+   - The **self-contextualization instructions** below
+
+**Subagent self-contextualization instructions** (include verbatim in the prompt):
+
+> You are an ongo research expansion agent. Before doing any research, build your context from kendb:
+>
+> 1. Run `KEN list --kind topic` to see all topics and their IDs.
+> 2. Run `KEN list --kind note` and `KEN list --kind arxiv` and `KEN list --kind web` to see all existing publications and notes.
+> 3. Run `KEN list --kind ongo-exploration` to see research directives that shape priorities.
+> 4. Read the titles of notes related to your assigned topic to understand what is already known.
+>
+> Then act as a **research analyst**:
+> - Identify gaps in the existing knowledge for this topic.
+> - Search the web for new work, recent papers, and developments.
+> - Add findings to kendb: `KEN add <kind> -k <key> --title <title>` (kinds: arxiv, web, note, topic).
+> - Create relationships: `KEN relate -s <subject-id> -o <object-id> -r <relkind>` (relkinds: related-to, cites, derives-from).
+> - Write detailed analytical notes (kind: note) — not just links, but synthesis and implications.
+> - Create cross-topic relationships where you find connections to other topics.
+> - Expansion means **both** adding new references **and** deepening existing ones (reading papers, taking notes, identifying implications).
+>
+> When done, report via: `clacks send -c "CHANNEL" -m "_[ongo] Expanded research on: <topic title> — <summary>_"`
+>
+> (Replace KEN and CHANNEL with the actual paths/IDs provided.)
+
+4. Continue the main loop immediately — do NOT wait for the expansion agent to finish.
+
+**For processing user messages**: also prefer delegating heavyweight research requests to subagents (using the most capable available model) with the same self-contextualization pattern. Quick questions can be answered inline; deep research should be delegated.
 
 ## Self-Improvement
 
