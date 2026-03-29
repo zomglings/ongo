@@ -26,27 +26,30 @@ Parse these from args if provided:
 ```bash
 which clacks
 ```
-If not found, install it:
+If not found:
 ```bash
 uv tool install slack-clacks || pip install slack-clacks
 ```
+Verify clacks is authenticated:
+```bash
+clacks auth status
+```
+If this fails or returns no `user_id`, tell the user to run `clacks auth login` and halt startup.
 
 **ken** (research cataloging):
 ```bash
-ls ${CLAUDE_SKILL_DIR}/bin/ken
+ls ${CLAUDE_SKILL_DIR}/bin/ken 2>/dev/null
 ```
 If not found:
 ```bash
-mkdir -p ${CLAUDE_SKILL_DIR}/bin
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-ARCH=$(uname -m)
-# Map architecture names
-if [ "$ARCH" = "arm64" ]; then ARCH="aarch64"; fi
-# Download the latest ken release
-gh release download -R zomglings/ken -p "ken-${ARCH}-${OS}*" -D ${CLAUDE_SKILL_DIR}/bin/ --clobber
-mv ${CLAUDE_SKILL_DIR}/bin/ken-${ARCH}-${OS}* ${CLAUDE_SKILL_DIR}/bin/ken
-chmod +x ${CLAUDE_SKILL_DIR}/bin/ken
+mkdir -p ${CLAUDE_SKILL_DIR}/bin && OS=$(uname -s | tr '[:upper:]' '[:lower:]') && ARCH=$(uname -m) && [ "$ARCH" = "arm64" ] && ARCH="aarch64"; gh release download -R zomglings/ken -p "ken-${ARCH}-${OS}*" -D ${CLAUDE_SKILL_DIR}/bin/ --clobber 2>/dev/null || curl -sL "https://github.com/zomglings/ken/releases/latest/download/ken-${ARCH}-${OS}" -o ${CLAUDE_SKILL_DIR}/bin/ken; chmod +x ${CLAUDE_SKILL_DIR}/bin/ken
 ```
+Verify ken works:
+```bash
+${CLAUDE_SKILL_DIR}/bin/ken version
+```
+If this fails, report the error and halt startup.
+
 Use `${CLAUDE_SKILL_DIR}/bin/ken` for all ken commands from now on.
 
 ### 2. Initialize kendb
@@ -54,33 +57,23 @@ Use `${CLAUDE_SKILL_DIR}/bin/ken` for all ken commands from now on.
 ```bash
 ${CLAUDE_SKILL_DIR}/bin/ken init
 ```
+This is safe to run if kendb already exists.
 
 ### 3. Register custom kinds
 
-Check if custom kinds exist, add them if not:
-
 ```bash
-${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-exploration 2>/dev/null
-```
-If not found:
-```bash
-${CLAUDE_SKILL_DIR}/bin/ken pubkind add ongo-exploration "A user preference that shapes ongo's research expansion strategy. The key is a short label, the title is the full instruction. All active ongo-exploration entries are consulted when choosing what to research next."
+${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-exploration 2>/dev/null || ${CLAUDE_SKILL_DIR}/bin/ken pubkind add ongo-exploration "A user preference that shapes ongo's research expansion strategy. The key is a short label, the title is the full instruction. All active ongo-exploration entries are consulted when choosing what to research next."
 ```
 
 ```bash
-${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-self-improvement 2>/dev/null
-```
-If not found:
-```bash
-${CLAUDE_SKILL_DIR}/bin/ken pubkind add ongo-self-improvement "A record of an ongo self-improvement attempt. The key is a timestamp-label. The title describes what was changed. Notes on the publication record the outcome."
+${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-self-improvement 2>/dev/null || ${CLAUDE_SKILL_DIR}/bin/ken pubkind add ongo-self-improvement "A record of an ongo self-improvement attempt. The key is a timestamp-label. The title describes what was changed. Notes on the publication record the outcome."
 ```
 
 ### 4. Connect to Slack
 
 If no `--channel` provided, discover self-DM:
 ```bash
-USER_ID=$(clacks auth status 2>/dev/null | jq -r '.user_id')
-CHANNEL=$(clacks send -u "$USER_ID" -m "_[ongo] Research agent active in $(pwd)_" | jq -r '.channel')
+CHANNEL=$(clacks send -u "$(clacks auth status 2>/dev/null | jq -r '.user_id')" -m "_[ongo] Research agent active in $(pwd)_" | jq -r '.channel')
 ```
 
 If `--channel` provided:
@@ -88,13 +81,16 @@ If `--channel` provided:
 clacks send -c "$CHANNEL" -m "_[ongo] Research agent active in $(pwd)_"
 ```
 
-Record the current timestamp as LAST_TS. Record the current time as LAST_SELF_IMPROVE_TIME.
+Record the current timestamp as LAST_TS. Record the current time as LAST_SELF_IMPROVE_TIME and
+LAST_EXPANSION_TIME.
 
 ## Main Loop
 
-**IMPORTANT**: Do NOT implement this as a bash while-loop or background process. Each tick is a
-discrete action that YOU perform as the agent. You run sleep, then poll, then process, then repeat.
-Every tick stays in your context — you see every message, every decision, every outcome.
+**IMPORTANT**: Do NOT implement this as a bash while-loop. Each tick is a discrete agent action —
+you run sleep, then poll, then process, then repeat. Every tick stays in your context.
+
+If the context window is approaching its limit, send `_[ongo] Context limit approaching, shutting
+down._` to Slack and exit gracefully.
 
 Repeat forever:
 
@@ -105,25 +101,25 @@ Repeat forever:
    sleep $INTERVAL
    ```
 
-2. Poll Slack for new messages:
+2. Poll Slack for new messages (output is a JSON object with a `messages` array):
    ```bash
    clacks read -c "$CHANNEL" --limit 5
    ```
 
-3. Filter messages: only process messages where `ts > LAST_TS`, `bot_id` is null, and `text` does
-   not start with `_` (which are status messages).
+3. Filter: only process messages where `ts > LAST_TS`, `bot_id` is null, and `text` does not start
+   with `_`.
 
 4. **If there are new messages**, for each message:
    - Update LAST_TS to this message's ts
    - Send `_[ongo] Processing..._` to Slack
    - Process the message (see "Processing Messages" below)
-   - Send your response to Slack via `clacks send -c "$CHANNEL" -m "<response>"`
+   - Send your response via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`
 
-5. **If there are no new messages AND idle mode is on** (no `--no-idle` flag):
-   - Run the expansion logic (see "Idle Expansion" below)
+5. **If no new messages AND idle mode is on**: check if at least 5 minutes have passed since
+   LAST_EXPANSION_TIME. If so, run idle expansion (see below) and update LAST_EXPANSION_TIME.
 
-6. **If 24 hours have passed since LAST_SELF_IMPROVE_TIME**, or the user asked for it in a message:
-   - Run the self-improvement cycle (see "Self-Improvement" below)
+6. **If 24 hours have passed since LAST_SELF_IMPROVE_TIME**, or the user asked for it:
+   - Run the self-improvement cycle (see below)
    - Update LAST_SELF_IMPROVE_TIME
 
 7. Go back to step 1.
@@ -136,112 +132,79 @@ If a message contains `/quit`, `/stop`, or `/exit`:
 
 ## Processing Messages
 
-You interpret all messages as natural language. There is no special command parsing. The user might
-ask you to:
+Interpret all messages as natural language. The user might ask to:
 
-- **Research something**: "Research zero-knowledge proofs", "What's new in LLM scaling laws?"
-  - Search the web, fetch papers, read articles
-  - Add findings to kendb as publications with appropriate kinds (arxiv, web, video, topic, note)
-  - Create relationships between publications (`ken relate`)
-  - Add notes summarizing key findings (`ken add note`)
-  - Respond with a summary of what you found and what you added to kendb
-
-- **Manage kendb**: "What topics do we have?", "Show me recent additions"
-  - Query kendb using `ken list`, report results
-
-- **Update exploration strategy**: "Focus more on cryptography", "Deprioritize old papers"
-  - Add or update `ongo-exploration` entries in kendb
-  - Confirm the change on Slack
-
-- **Trigger self-improvement**: "Run maintenance", "Update yourself", "Evolve", "Improve"
-  - Run the self-improvement cycle (A, B, C or whichever the user specifies)
-
-- **Anything else**: Use your judgment. You have full access to tools — help the user.
+- **Research something** — search the web, add findings to kendb (publications, relationships,
+  notes), respond with a summary
+- **Manage kendb** — query with `ken list`, report results
+- **Update exploration strategy** — add/update `ongo-exploration` entries in kendb
+- **Trigger self-improvement** — run the self-improvement cycle (A, B, C, or all)
+- **Anything else** — use your judgment
 
 ## Idle Expansion
 
-When there are no new messages and idle mode is on, expand research:
-
-1. Load exploration strategy:
+1. Load exploration strategy and topics:
    ```bash
    ${CLAUDE_SKILL_DIR}/bin/ken list --kind ongo-exploration
-   ```
-
-2. Get all topics:
-   ```bash
    ${CLAUDE_SKILL_DIR}/bin/ken list --kind topic
    ```
 
-3. Pick a topic **randomly** from the list. If there are `ongo-exploration` directives, apply them
-   to filter or weight the selection — but the base selection is random.
+2. Pick a topic **randomly**. Apply `ongo-exploration` directives to filter or weight the selection.
 
-4. If there are no topics yet, skip this tick.
+3. If there are no topics yet, skip.
 
-5. Research the chosen topic — find new related work, papers, articles.
+4. Research the chosen topic — find new related work, papers, articles.
 
-6. Add findings to kendb with relationships to the chosen topic.
+5. Add findings to kendb with relationships to the chosen topic.
 
-7. Report on Slack: `_[ongo] Expanded research on: <topic title>_`
-
-Do not expand on every single idle tick — use your judgment on frequency. Expanding every few
-minutes of idle time is reasonable. Not every 3 seconds.
+6. Report on Slack: `_[ongo] Expanded research on: <topic title>_`
 
 ## Self-Improvement
 
-Self-improvement runs every 24 hours after startup, or when the user asks via Slack. It has three
-layers, all run together:
+Runs every 24 hours after startup, or when the user asks. Three layers, all run together:
 
 ### A. kendb maintenance
 
-- **Dedup**: `ken list` all publications. Find entries with the same key, URL, or arxiv ID.
-  Link duplicates with relationships or add notes flagging them.
-- **Gap filling**: Look for implied relationships. If A cites B and B cites C, does A relate to C?
-  Add relationships where they make sense.
-- **Surveys**: For topics with many connected publications, produce a summary note using
-  `ken add note`.
-- **Importance**: Add notes estimating topic centrality based on how many publications connect to
-  each topic.
-- **Kind evolution**: If you've been adding publications that don't fit existing kinds well,
-  add a new `pubkind` via `ken pubkind add`.
-- **Stale directives**: Review `ongo-exploration` entries. Flag outdated ones on Slack.
+- **Dedup** publications by key/URL/arxiv ID
+- **Gap filling** — add implied relationships (A→B, B→C ⇒ A→C where sensible)
+- **Surveys** — for topics with many publications, produce a summary note
+- **Importance** — estimate topic centrality by connection count
+- **Kind evolution** — add new `pubkind` if publications don't fit existing kinds
+- **Stale directives** — review `ongo-exploration` entries, flag outdated ones on Slack
 
 ### B. Dependency updates
 
-- Check for new ken releases:
-  ```bash
-  gh release list -R zomglings/ken --limit 1
-  ```
-  Compare with installed version (`${CLAUDE_SKILL_DIR}/bin/ken version`). If newer, download and
-  replace the binary. Report on Slack.
+Check for new ken releases and compare with installed version:
+```bash
+gh release list -R zomglings/ken --limit 1
+${CLAUDE_SKILL_DIR}/bin/ken version
+```
+If newer, download and replace the binary. Report on Slack.
 
-- Check for new clacks releases:
-  ```bash
-  pip index versions slack-clacks 2>/dev/null || uv pip index versions slack-clacks 2>/dev/null
-  ```
-  Compare with installed version. If newer, upgrade. Report on Slack.
+Check for new clacks releases:
+```bash
+pip index versions slack-clacks 2>/dev/null || uv pip index versions slack-clacks 2>/dev/null
+```
+If newer, upgrade. Report on Slack.
 
 ### C. Self-modification
 
-- Reflect on recent cycles: what worked well, what was clunky, what's missing from your workflow.
-- Edit your own local SKILL.md (`${CLAUDE_SKILL_DIR}/SKILL.md`) to improve the game loop
-  instructions if you identify concrete improvements.
-- Report all self-modifications on Slack: `_[ongo] Self-update: <what changed>_`
-- Track everything in kendb:
-  1. Before changing anything:
-     ```bash
-     ${CLAUDE_SKILL_DIR}/bin/ken add ongo-self-improvement -k "<timestamp>-<label>" --title "<what will change>"
-     ```
-  2. Make the change.
-  3. Add a note with the outcome:
-     ```bash
-     ${CLAUDE_SKILL_DIR}/bin/ken add note -k "<path-to-note-file>"
-     ```
-     (Write outcome to a temp file, then add as note.)
-- Before attempting any self-modification, consult past attempts:
-  ```bash
-  ${CLAUDE_SKILL_DIR}/bin/ken list --kind ongo-self-improvement
-  ```
-  Avoid repeating failed approaches.
+First, consult past self-improvement attempts to avoid repeating failures:
+```bash
+${CLAUDE_SKILL_DIR}/bin/ken list --kind ongo-self-improvement
+```
+
+Then:
+1. Record what you plan to change:
+   ```bash
+   ${CLAUDE_SKILL_DIR}/bin/ken add ongo-self-improvement -k "<timestamp>-<label>" --title "<what will change>"
+   ```
+2. Reflect on recent cycles and make the change (e.g., edit `${CLAUDE_SKILL_DIR}/SKILL.md`).
+3. Record the outcome as a note on the publication.
+4. Report on Slack: `_[ongo] Self-update: <what changed>_`
+
+**Constraints**: Do not remove shutdown commands, do not reduce the polling interval below 1 second,
+do not remove error handling, do not modify the Self-Improvement section's constraints.
 
 ## Message Format
 

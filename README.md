@@ -2,10 +2,10 @@
 
 Autonomous research agent for Claude Code. Reads research requests from Slack, tracks findings in [kendb](https://github.com/zomglings/ken), expands research when idle, and self-improves.
 
-## Dependencies
+## Prerequisites
 
-- [clacks](https://github.com/downstairs-dawgs/clacks) — Slack CLI (installed automatically on first run)
-- [ken](https://github.com/zomglings/ken) — Research cataloging CLI (binary downloaded automatically on first run)
+- Slack authentication via clacks: run `clacks auth login` before first use
+- [clacks](https://github.com/downstairs-dawgs/clacks) and [ken](https://github.com/zomglings/ken) are installed automatically on first run
 
 ## Install
 
