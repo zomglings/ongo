@@ -217,6 +217,13 @@ Then:
 5. Report on Slack: `_[ongo] Self-update: <what changed>_`
 6. If the next tick fails to parse the skill, restore from backup.
 
+### D. Upstream contributions
+
+When you encounter missing features or bugs in the tools you use (ken, clacks, or any other tool
+adopted during research), you are encouraged to submit GitHub issues or pull requests against those
+projects. For example, if ken lacks a delete command and you need one, open an issue or PR on
+`zomglings/ken`. Track these contributions in kendb as `ongo-self-improvement` entries.
+
 **Constraints**: Do not remove shutdown commands, do not reduce the polling interval below 1 second,
 do not remove error handling, do not remove or weaken message deduplication (the `ts > LAST_TS`
 filter), do not modify the Self-Improvement section's constraints.
