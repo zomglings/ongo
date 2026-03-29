@@ -8,9 +8,6 @@ args: "[--channel <channel_id>] [--interval <seconds>] [--no-idle]"
 
 # Ongo — Autonomous Research Agent
 
-When this skill is invoked, you become an autonomous research agent. You poll Slack for messages,
-process research requests, track everything in kendb, and expand your research when idle.
-
 ## Parameters
 
 Parse these from args if provided:
@@ -22,6 +19,12 @@ Parse these from args if provided:
 
 ### 1. Install dependencies
 
+**jq** (JSON processor):
+```bash
+which jq
+```
+If not found, tell the user to install jq and halt startup.
+
 **clacks** (Slack CLI):
 ```bash
 which clacks
@@ -30,11 +33,12 @@ If not found:
 ```bash
 uv tool install slack-clacks || pip install slack-clacks
 ```
-Verify clacks is authenticated:
+Verify clacks is authenticated and capture user info for later:
 ```bash
-clacks auth status
+AUTH_INFO=$(clacks auth status)
 ```
-If this fails or returns no `user_id`, tell the user to run `clacks auth login` and halt startup.
+If this fails or `echo "$AUTH_INFO" | jq -r '.user_id'` is empty, tell the user to run
+`clacks auth login` and halt startup. Save the USER_ID for step 4.
 
 **ken** (research cataloging):
 ```bash
@@ -42,7 +46,7 @@ ls ${CLAUDE_SKILL_DIR}/bin/ken 2>/dev/null
 ```
 If not found:
 ```bash
-mkdir -p ${CLAUDE_SKILL_DIR}/bin && OS=$(uname -s | tr '[:upper:]' '[:lower:]') && ARCH=$(uname -m) && [ "$ARCH" = "arm64" ] && ARCH="aarch64"; gh release download -R zomglings/ken -p "ken-${ARCH}-${OS}*" -D ${CLAUDE_SKILL_DIR}/bin/ --clobber 2>/dev/null || curl -sL "https://github.com/zomglings/ken/releases/latest/download/ken-${ARCH}-${OS}" -o ${CLAUDE_SKILL_DIR}/bin/ken; chmod +x ${CLAUDE_SKILL_DIR}/bin/ken
+mkdir -p ${CLAUDE_SKILL_DIR}/bin && OS=$(uname -s | tr '[:upper:]' '[:lower:]') && ARCH=$(uname -m) && { [ "$ARCH" = "arm64" ] && ARCH="aarch64" || true; } && { gh release download -R zomglings/ken -p "ken-${ARCH}-${OS}*" -D ${CLAUDE_SKILL_DIR}/bin/ --clobber 2>/dev/null && mv ${CLAUDE_SKILL_DIR}/bin/ken-${ARCH}-${OS}* ${CLAUDE_SKILL_DIR}/bin/ken || curl -sL "https://github.com/zomglings/ken/releases/latest/download/ken-${ARCH}-${OS}" -o ${CLAUDE_SKILL_DIR}/bin/ken; } && chmod +x ${CLAUDE_SKILL_DIR}/bin/ken
 ```
 Verify ken works:
 ```bash
@@ -71,10 +75,11 @@ ${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-self-improvement 2>/dev/null || ${
 
 ### 4. Connect to Slack
 
-If no `--channel` provided, discover self-DM:
+If no `--channel` provided, discover self-DM using USER_ID from step 1:
 ```bash
-CHANNEL=$(clacks send -u "$(clacks auth status 2>/dev/null | jq -r '.user_id')" -m "_[ongo] Research agent active in $(pwd)_" | jq -r '.channel')
+CHANNEL=$(clacks send -u "$USER_ID" -m "_[ongo] Research agent active in $(pwd)_" | jq -r '.channel')
 ```
+If CHANNEL is empty after this, report the error and halt startup.
 
 If `--channel` provided:
 ```bash
@@ -96,31 +101,32 @@ Repeat forever:
 
 ### Tick
 
-1. Sleep for the interval:
-   ```bash
-   sleep $INTERVAL
-   ```
-
-2. Poll Slack for new messages (output is a JSON object with a `messages` array):
+1. Poll Slack for new messages (output is a JSON object with a `messages` array):
    ```bash
    clacks read -c "$CHANNEL" --limit 5
    ```
+   If this fails (network error, auth expiry), log the error and continue to the next tick.
 
-3. Filter: only process messages where `ts > LAST_TS`, `bot_id` is null, and `text` does not start
+2. Filter: only process messages where `ts > LAST_TS`, `bot_id` is null, and `text` does not start
    with `_`.
 
-4. **If there are new messages**, for each message:
+3. **If there are new messages**, for each message:
    - Update LAST_TS to this message's ts
    - Send `_[ongo] Processing..._` to Slack
    - Process the message (see "Processing Messages" below)
    - Send your response via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`
 
-5. **If no new messages AND idle mode is on**: check if at least 5 minutes have passed since
+4. **If no new messages AND idle mode is on**: check if at least 5 minutes have passed since
    LAST_EXPANSION_TIME. If so, run idle expansion (see below) and update LAST_EXPANSION_TIME.
 
-6. **If 24 hours have passed since LAST_SELF_IMPROVE_TIME**, or the user asked for it:
+5. **If 24 hours have passed since LAST_SELF_IMPROVE_TIME**, or the user asked for it:
    - Run the self-improvement cycle (see below)
    - Update LAST_SELF_IMPROVE_TIME
+
+6. Sleep for the interval:
+   ```bash
+   sleep $INTERVAL
+   ```
 
 7. Go back to step 1.
 
@@ -204,7 +210,8 @@ Then:
 4. Report on Slack: `_[ongo] Self-update: <what changed>_`
 
 **Constraints**: Do not remove shutdown commands, do not reduce the polling interval below 1 second,
-do not remove error handling, do not modify the Self-Improvement section's constraints.
+do not remove error handling, do not remove or weaken message deduplication (the `ts > LAST_TS`
+filter), do not modify the Self-Improvement section's constraints.
 
 ## Message Format
 
