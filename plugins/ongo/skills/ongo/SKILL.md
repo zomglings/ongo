@@ -171,12 +171,12 @@ Every 24h or on request. Five layers, all run together:
 
 ### A. kendb maintenance
 
-- **Dedup** by key/URL/arxiv ID
+- **Dedup** by key/URL/arxiv ID — use `${CLAUDE_SKILL_DIR}/bin/ongo-delete` to remove duplicates after identifying them. Preview with `--dry-run` first, then delete the duplicate publication(s) keeping the one with richer notes/relationships.
 - **Gap filling** — implied relationships (depth 1, cap 20 per cycle)
 - **Surveys** — summary notes for topics with many publications
 - **Importance** — topic centrality by connection count
 - **Kind evolution** — new `pubkind` if needed
-- **Stale directives** — review `ongo-exploration`, flag outdated on Slack
+- **Stale directives** — review `ongo-exploration`, flag outdated on Slack. Use `ongo-delete pub --kind ongo-exploration` (with `--dry-run` first) to remove directives that are no longer relevant, or `ongo-delete pub <id>` to remove individual stale entries.
 
 ### B. Dependency updates
 
@@ -217,3 +217,19 @@ File issues/PRs against tools (ken, clacks, etc.) when you hit bugs or missing f
 
 - **Always** prepend `[ongo]` to every sent message — this is how the poll filter works. Omitting it causes an infinite loop.
 - Truncate responses over 30000 chars. Use `_..._` for status messages.
+
+## kendb Management Tools
+
+### ongo-delete
+
+`${CLAUDE_SKILL_DIR}/bin/ongo-delete` — delete publications and relationships from kendb. This is a stopgap until ken gains native delete support.
+
+```
+ongo-delete pub <id>              # Delete a publication (+ its relationships and notes)
+ongo-delete pub --key <key>       # Delete by key (URL, DOI, path, etc.)
+ongo-delete pub --kind <kind>     # Delete all publications of a kind
+ongo-delete rel <id>              # Delete a single relationship
+ongo-delete --dry-run ...         # Preview without deleting
+```
+
+Always use `--dry-run` first when deleting by `--kind` to avoid accidentally removing wanted entries. The script handles the ON DELETE RESTRICT constraint on relationships by deleting them before the publication.
