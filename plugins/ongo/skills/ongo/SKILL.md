@@ -156,14 +156,26 @@ Interpret as natural language. The user might ask to:
 
 ## Auto-Expansion
 
-1. Load strategy and topics:
+**CRITICAL — Memory check before spawning subagents**: Before launching ANY subagent (auto-expansion or user-triggered), check available free memory via `free -m | awk '/^Mem:/ {print $7}'` (returns available MiB).
+
+Three thresholds:
+- **≥ 1024 MiB free**: normal operation, spawn any subagent (Sonnet or Opus).
+- **512–1023 MiB free**: memory pressure. Prefer Sonnet (smaller footprint) over Opus. Skip passive auto-expansion this tick; only honor user-triggered requests.
+- **< 512 MiB free**: critical. Do NOT spawn any subagent. Send `_[ongo] Memory pressure (< 512 MiB free) — deferring all subagent launches until next tick._` and skip the expansion step entirely for both user requests and passive research.
+
+**Re-tier up when pressure loosens**: these thresholds are checked *every* tick, not sticky. When free memory rises back above a threshold, resume normal operation for that tier on the very next tick — do not stay degraded after the pressure clears. The goal is to gate spawns by current conditions, not to lock ongo into a conservative mode after one bad reading.
+
+Rationale: subagents (especially Opus) have substantial memory footprints. Running under memory pressure risks OOM, which kills the whole session and breaks the loop. The loop must never stop — it is better to skip a tick than crash the agent.
+
+1. **Memory check**: `free -m | awk '/^Mem:/ {print $7}'` — apply the three-threshold rule above.
+2. Load strategy and topics:
    ```bash
    ${CLAUDE_SKILL_DIR}/bin/ken list --kind ongo-exploration
    ${CLAUDE_SKILL_DIR}/bin/ken list --kind topic
    ```
-2. Pick a topic **randomly**, weighted by `ongo-exploration` directives. Skip if no topics.
-3. Research new related work, add findings to kendb with relationships.
-4. Report: `_[ongo] Expanded research on: <topic title>_`
+3. Pick a topic **randomly**, weighted by `ongo-exploration` directives. Skip if no topics.
+4. Research new related work, add findings to kendb with relationships.
+5. Report: `_[ongo] Expanded research on: <topic title>_`
 
 ## Self-Improvement
 
@@ -171,12 +183,12 @@ Every 24h or on request. Five layers, all run together:
 
 ### A. kendb maintenance
 
-- **Dedup** by key/URL/arxiv ID
+- **Dedup** by key/URL/arxiv ID — use `${CLAUDE_SKILL_DIR}/bin/ongo-delete` to remove duplicates after identifying them. Preview with `--dry-run` first, then delete the duplicate publication(s) keeping the one with richer notes/relationships.
 - **Gap filling** — implied relationships (depth 1, cap 20 per cycle)
 - **Surveys** — summary notes for topics with many publications
 - **Importance** — topic centrality by connection count
 - **Kind evolution** — new `pubkind` if needed
-- **Stale directives** — review `ongo-exploration`, flag outdated on Slack
+- **Stale directives** — review `ongo-exploration`, flag outdated on Slack. Use `ongo-delete pub --kind ongo-exploration` (with `--dry-run` first) to remove directives that are no longer relevant, or `ongo-delete pub <id>` to remove individual stale entries.
 
 ### B. Dependency updates
 
@@ -217,3 +229,19 @@ File issues/PRs against tools (ken, clacks, etc.) when you hit bugs or missing f
 
 - **Always** prepend `[ongo]` to every sent message — this is how the poll filter works. Omitting it causes an infinite loop.
 - Truncate responses over 30000 chars. Use `_..._` for status messages.
+
+## kendb Management Tools
+
+### ongo-delete
+
+`${CLAUDE_SKILL_DIR}/bin/ongo-delete` — delete publications and relationships from kendb. This is a stopgap until ken gains native delete support.
+
+```
+ongo-delete pub <id>              # Delete a publication (+ its relationships and notes)
+ongo-delete pub --key <key>       # Delete by key (URL, DOI, path, etc.)
+ongo-delete pub --kind <kind>     # Delete all publications of a kind
+ongo-delete rel <id>              # Delete a single relationship
+ongo-delete --dry-run ...         # Preview without deleting
+```
+
+Always use `--dry-run` first when deleting by `--kind` to avoid accidentally removing wanted entries. The script handles the ON DELETE RESTRICT constraint on relationships by deleting them before the publication.
