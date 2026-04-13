@@ -156,14 +156,26 @@ Interpret as natural language. The user might ask to:
 
 ## Auto-Expansion
 
-1. Load strategy and topics:
+**CRITICAL — Memory check before spawning subagents**: Before launching ANY subagent (auto-expansion or user-triggered), check available free memory via `free -m | awk '/^Mem:/ {print $7}'` (returns available MiB).
+
+Three thresholds:
+- **≥ 1024 MiB free**: normal operation, spawn any subagent (Sonnet or Opus).
+- **512–1023 MiB free**: memory pressure. Prefer Sonnet (smaller footprint) over Opus. Skip passive auto-expansion this tick; only honor user-triggered requests.
+- **< 512 MiB free**: critical. Do NOT spawn any subagent. Send `_[ongo] Memory pressure (< 512 MiB free) — deferring all subagent launches until next tick._` and skip the expansion step entirely for both user requests and passive research.
+
+**Re-tier up when pressure loosens**: these thresholds are checked *every* tick, not sticky. When free memory rises back above a threshold, resume normal operation for that tier on the very next tick — do not stay degraded after the pressure clears. The goal is to gate spawns by current conditions, not to lock ongo into a conservative mode after one bad reading.
+
+Rationale: subagents (especially Opus) have substantial memory footprints. Running under memory pressure risks OOM, which kills the whole session and breaks the loop. The loop must never stop — it is better to skip a tick than crash the agent.
+
+1. **Memory check**: `free -m | awk '/^Mem:/ {print $7}'` — apply the three-threshold rule above.
+2. Load strategy and topics:
    ```bash
    ${CLAUDE_SKILL_DIR}/bin/ken list --kind ongo-exploration
    ${CLAUDE_SKILL_DIR}/bin/ken list --kind topic
    ```
-2. Pick a topic **randomly**, weighted by `ongo-exploration` directives. Skip if no topics.
-3. Research new related work, add findings to kendb with relationships.
-4. Report: `_[ongo] Expanded research on: <topic title>_`
+3. Pick a topic **randomly**, weighted by `ongo-exploration` directives. Skip if no topics.
+4. Research new related work, add findings to kendb with relationships.
+5. Report: `_[ongo] Expanded research on: <topic title>_`
 
 ## Self-Improvement
 
