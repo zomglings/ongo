@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""ongo-delete — Delete publications and relationships from kendb.
+
+Ken (the knowledge database used by ongo) has no native delete command.
+This script provides delete functionality by operating directly on ken's
+SQLite database.
+
+Usage:
+    ongo-delete pub <id>              Delete a publication by ID (and its relationships/notes)
+    ongo-delete pub --key <key>       Delete publication(s) matching a key
+    ongo-delete pub --kind <kind>     Delete all publications of a given kind
+    ongo-delete rel <id>              Delete a single relationship by ID
+    ongo-delete --dry-run ...         Preview what would be deleted without deleting
+
+The database path defaults to ~/.local/share/ken/ken.db and respects
+XDG_DATA_HOME if set.
+"""
+
+import argparse
+import os
+import sqlite3
+import sys
+import textwrap
+
+
+def get_db_path():
+    """Return the ken database path, respecting XDG_DATA_HOME."""
+    data_home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+    return os.path.join(data_home, "ken", "ken.db")
+
+
+def connect(db_path):
+    """Open a connection to the ken database with foreign keys enabled."""
+    if not os.path.exists(db_path):
+        print(f"error: database not found at {db_path}", file=sys.stderr)
+        print("hint: run 'ken init' first, or set XDG_DATA_HOME", file=sys.stderr)
+        sys.exit(1)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def find_relationships_for_pub(conn, pub_id):
+    """Return all relationships where the publication is subject or object."""
+    rows = conn.execute(
+        "SELECT id, subject, object, kind FROM relationships "
+        "WHERE subject = ? OR object = ?",
+        (pub_id, pub_id),
+    ).fetchall()
+    return rows
+
+
+def find_notes_for_pub(conn, pub_id):
+    """Return all notes attached to a publication."""
+    rows = conn.execute(
+        "SELECT id, body FROM notes WHERE publication = ?",
+        (pub_id,),
+    ).fetchall()
+    return rows
+
+
+def describe_pub(row):
+    """Format a publication row for display."""
+    parts = [f"  pub {row['id']}"]
+    if row["key"]:
+        parts.append(f"key={row['key']}")
+    if row["kind"]:
+        parts.append(f"kind={row['kind']}")
+    if row["title"]:
+        title = row["title"]
+        if len(title) > 80:
+            title = title[:77] + "..."
+        parts.append(f'"{title}"')
+    return " ".join(parts)
+
+
+def describe_rel(row):
+    """Format a relationship row for display."""
+    return f"  rel {row['id']}  {row['subject']} --[{row['kind']}]--> {row['object']}"
+
+
+def describe_note(row):
+    """Format a note row for display."""
+    body = row["body"] or ""
+    if len(body) > 60:
+        body = body[:57] + "..."
+    body = body.replace("\n", " ")
+    return f"  note {row['id']}  {body!r}"
+
+
+def delete_publication(conn, pub_id, dry_run=False):
+    """Delete a single publication, its relationships, and notes.
+
+    Relationships have ON DELETE RESTRICT, so they must be deleted first.
+    Notes have ON DELETE CASCADE, so they are removed automatically, but
+    we report them for visibility.
+    """
+    pub = conn.execute(
+        "SELECT id, key, kind, title FROM publications WHERE id = ?",
+        (pub_id,),
+    ).fetchone()
+    if not pub:
+        print(f"  publication {pub_id} not found — skipping")
+        return 0
+
+    rels = find_relationships_for_pub(conn, pub_id)
+    notes = find_notes_for_pub(conn, pub_id)
+
+    print(describe_pub(pub))
+    for note in notes:
+        print(describe_note(note))
+    for rel in rels:
+        print(describe_rel(rel))
+
+    if dry_run:
+        return 1
+
+    # Delete relationships first (ON DELETE RESTRICT)
+    for rel in rels:
+        conn.execute("DELETE FROM relationships WHERE id = ?", (rel["id"],))
+
+    # Delete publication (notes cascade)
+    conn.execute("DELETE FROM publications WHERE id = ?", (pub_id,))
+    return 1
+
+
+def cmd_pub_by_id(conn, pub_id, dry_run=False):
+    """Delete a single publication by its ID."""
+    prefix = "[dry run] " if dry_run else ""
+    print(f"{prefix}Deleting publication {pub_id}:")
+    count = delete_publication(conn, pub_id, dry_run=dry_run)
+    if count == 0:
+        print("Nothing to delete.")
+    elif not dry_run:
+        conn.commit()
+        print(f"Deleted 1 publication.")
+    else:
+        print(f"Would delete 1 publication.")
+
+
+def cmd_pub_by_key(conn, key, dry_run=False):
+    """Delete publications matching a key."""
+    pubs = conn.execute(
+        "SELECT id, key, kind, title FROM publications WHERE key = ?",
+        (key,),
+    ).fetchall()
+
+    if not pubs:
+        print(f"No publications found with key: {key}")
+        return
+
+    prefix = "[dry run] " if dry_run else ""
+    print(f"{prefix}Deleting {len(pubs)} publication(s) with key={key!r}:")
+    print()
+
+    count = 0
+    for pub in pubs:
+        count += delete_publication(conn, pub["id"], dry_run=dry_run)
+        print()
+
+    if not dry_run:
+        conn.commit()
+        print(f"Deleted {count} publication(s).")
+    else:
+        print(f"Would delete {count} publication(s).")
+
+
+def cmd_pub_by_kind(conn, kind, dry_run=False):
+    """Delete all publications of a given kind."""
+    pubs = conn.execute(
+        "SELECT id, key, kind, title FROM publications WHERE kind = ?",
+        (kind,),
+    ).fetchall()
+
+    if not pubs:
+        print(f"No publications found with kind: {kind}")
+        return
+
+    prefix = "[dry run] " if dry_run else ""
+    print(f"{prefix}Deleting {len(pubs)} publication(s) of kind={kind!r}:")
+    print()
+
+    count = 0
+    for pub in pubs:
+        count += delete_publication(conn, pub["id"], dry_run=dry_run)
+        print()
+
+    if not dry_run:
+        conn.commit()
+        print(f"Deleted {count} publication(s).")
+    else:
+        print(f"Would delete {count} publication(s).")
+
+
+def cmd_rel_by_id(conn, rel_id, dry_run=False):
+    """Delete a single relationship by its ID."""
+    rel = conn.execute(
+        "SELECT id, subject, object, kind FROM relationships WHERE id = ?",
+        (rel_id,),
+    ).fetchone()
+
+    if not rel:
+        print(f"Relationship {rel_id} not found.")
+        return
+
+    prefix = "[dry run] " if dry_run else ""
+    print(f"{prefix}Deleting relationship:")
+    print(describe_rel(rel))
+
+    if not dry_run:
+        conn.execute("DELETE FROM relationships WHERE id = ?", (rel_id,))
+        conn.commit()
+        print("Deleted 1 relationship.")
+    else:
+        print("Would delete 1 relationship.")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="ongo-delete",
+        description="Delete publications and relationships from kendb.",
+        epilog=textwrap.dedent("""\
+            examples:
+              ongo-delete pub abc123                     Delete publication by ID
+              ongo-delete pub --key https://arxiv.org/x  Delete by key (URL, DOI, etc.)
+              ongo-delete pub --kind ongo-exploration     Delete all of a kind
+              ongo-delete rel def456                     Delete a relationship by ID
+              ongo-delete --dry-run pub --kind topic      Preview without deleting
+        """),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show what would be deleted without actually deleting",
+    )
+    parser.add_argument(
+        "--db",
+        metavar="PATH",
+        default=None,
+        help="path to ken database (default: ~/.local/share/ken/ken.db)",
+    )
+
+    sub = parser.add_subparsers(dest="entity", help="what to delete")
+
+    pub_parser = sub.add_parser("pub", help="delete publication(s)")
+    pub_parser.add_argument("id", nargs="?", default=None, help="publication ID")
+    pub_parser.add_argument("--key", default=None, help="delete by key")
+    pub_parser.add_argument("--kind", default=None, help="delete all of a kind")
+
+    rel_parser = sub.add_parser("rel", help="delete a relationship")
+    rel_parser.add_argument("id", help="relationship ID")
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.entity:
+        parser.print_help()
+        sys.exit(1)
+
+    db_path = args.db or get_db_path()
+    conn = connect(db_path)
+
+    try:
+        if args.entity == "pub":
+            if args.id:
+                cmd_pub_by_id(conn, args.id, dry_run=args.dry_run)
+            elif args.key:
+                cmd_pub_by_key(conn, args.key, dry_run=args.dry_run)
+            elif args.kind:
+                cmd_pub_by_kind(conn, args.kind, dry_run=args.dry_run)
+            else:
+                print("error: provide a publication ID, --key, or --kind", file=sys.stderr)
+                sys.exit(1)
+        elif args.entity == "rel":
+            cmd_rel_by_id(conn, args.id, dry_run=args.dry_run)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

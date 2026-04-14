@@ -3,7 +3,7 @@ name: ongo
 description: >-
   Autonomous research agent. Polls Slack for research requests, tracks findings
   in kendb, expands research when idle, and self-improves on a 24-hour cycle.
-args: "[--channel <channel_id>] [--interval <seconds>] [--idle]"
+args: "[--channel <channel_id>] [--interval <minutes>] [--idle]"
 ---
 
 # Ongo — Autonomous Research Agent
@@ -11,7 +11,7 @@ args: "[--channel <channel_id>] [--interval <seconds>] [--idle]"
 ## Parameters
 
 - `--channel <id>` — Slack channel (default: auto-discover self-DM)
-- `--interval <seconds>` — tick sleep (default: 3)
+- `--interval <minutes>` — tick interval in minutes (default: 30)
 - `--idle` — only respond to messages; disable auto-expansion
 
 ## Startup
@@ -49,6 +49,10 @@ ${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-exploration 2>/dev/null || ${CLAUD
 ${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-self-improvement 2>/dev/null || ${CLAUDE_SKILL_DIR}/bin/ken pubkind add ongo-self-improvement "A record of an ongo self-improvement attempt. The key is a timestamp-label. The title describes what was changed. Notes on the publication record the outcome."
 ```
 
+```bash
+${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-cron-reset 2>/dev/null || ${CLAUDE_SKILL_DIR}/bin/ken pubkind add ongo-cron-reset "A record of a CronCreate renewal. The key is a timestamp. The title records the old and new cron job IDs. Ongo must renew its cron job every 3 days to prevent the 7-day auto-expiry from killing the loop."
+```
+
 ### 4. Connect to Slack
 
 If no `--channel`, discover self-DM:
@@ -57,24 +61,91 @@ CHANNEL=$(clacks send -u "$USER_ID" -m "_[ongo] Research agent active in $(pwd)_
 ```
 If `--channel` provided: `clacks send -c "$CHANNEL" -m "_[ongo] Research agent active in $(pwd)_"`
 
-If CHANNEL is empty, halt. Set LAST_TS to now. Set LAST_SELF_IMPROVE_TIME to now.
+If CHANNEL is empty, halt.
+
+### 5. Initialize state and start cron loop
+
+Write initial state to `/tmp/ongo_state.json`:
+```json
+{
+  "channel": "<CHANNEL>",
+  "last_ts": "<ts of startup message>",
+  "last_self_improve": <current unix epoch>,
+  "rotation": "reference",
+  "idle": false,
+  "ken": "${CLAUDE_SKILL_DIR}/bin/ken",
+  "cron_created": <current unix epoch>
+}
+```
+
+Set `idle` to `true` if `--idle` was passed.
+
+Compute the cron expression from `--interval` (default 30 minutes):
+- For intervals that evenly divide 60 (e.g. 5, 10, 15, 30): use `*/N` with a small offset to avoid :00/:30 marks. Example: 30 min → `"7,37 * * * *"`, 15 min → `"7,22,37,52 * * * *"`.
+- For other intervals: pick explicit minutes that approximate the interval. Example: 20 min → `"7,27,47 * * * *"`.
+
+Create the cron job using **CronCreate**:
+```
+cron: "<computed expression>"
+recurring: true
+prompt: <THE TICK PROMPT — see below>
+```
+
+The tick prompt must be **self-contained** since each cron fire is a fresh context. It should contain:
+
+> Run one ongo research agent tick.
+>
+> 1. Read state: `cat /tmp/ongo_state.json`
+> 2. Poll Slack: `clacks read -c "$CHANNEL" --after "$LAST_TS"`
+> 3. Filter out messages where `text` starts with `[ongo]` or `_[ongo]`.
+> 4. **If user messages exist**: send `_[ongo] Processing..._`, process each, update last_ts.
+> 5. **If no user messages AND not idle**: run auto-expansion — pick a random topic from kendb weighted by exploration directives, launch a background research subagent (rotate: reference/Sonnet → deep notes/Opus → survey/Opus).
+> 6. **If 24h since last_self_improve**: run self-improvement cycle (layers A–E per SKILL.md).
+> 7. **On `/quit`, `/stop`, `/exit`**: send `_[ongo] Shutting down._`, delete the cron job via CronDelete, and stop.
+> 8. Write updated state back to `/tmp/ongo_state.json`.
+>
+> Always prepend `[ongo]` to every Slack message. Ken binary at: $KEN. Truncate responses over 30000 chars.
+
+After creating the cron job, report:
+```
+_[ongo] Research agent active — cron loop every N min. Session-only, auto-expires after 7 days._
+```
+
+Store the cron job ID and creation timestamp in `/tmp/ongo_state.json` as `"cron_id"` and `"cron_created"` so it can be renewed and cancelled.
 
 ## Main Loop
 
-**IMPORTANT**: NOT a bash while-loop. Each tick is a discrete agent action. Every tick stays in context. Do NOT preemptively shut down for context concerns — auto-compact handles this. Only shut down on explicit user command (`/quit`, `/stop`, `/exit`).
+The main loop is driven by **CronCreate** — each tick fires as an independent cron job when the REPL is idle. There is no `sleep` or blocking wait. This means:
 
-### Tick
+- **Context is freed between ticks** — the agent is not consuming resources while waiting.
+- **User can interact normally** between ticks — the REPL remains responsive.
+- **Ticks fire at consistent wall-clock times** regardless of how long the previous tick took.
+- **Session-only** — the cron job dies when Claude exits. Auto-expires after 7 days.
 
-1. `clacks read -c "$CHANNEL" --after "$LAST_TS"` — on failure, log and skip to step 6.
-2. Filter out messages where `text` starts with `[ongo]` or `_[ongo]`. Sort remainder by `ts` ascending.
-3. **New messages**: send `_[ongo] Processing..._`, then for each: update LAST_TS to its `ts`, process it, respond via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`.
-4. **No new messages AND not `--idle`**: run auto-expansion.
-5. **24h since LAST_SELF_IMPROVE_TIME** (or user requested): run self-improvement, update LAST_SELF_IMPROVE_TIME.
-6. `sleep $INTERVAL`, go to 1.
+**CRITICAL — Cron renewal**: CronCreate jobs auto-expire after 7 days. To ensure ongo **never stops looping**, every tick must check `cron_created` in state. If 3 days (259200 seconds) have passed since cron creation, **renew the cron job**: delete the old one via CronDelete, create a fresh one via CronCreate with the same expression and prompt, update `cron_id` and `cron_created` in state. Track each renewal in kendb as an `ongo-cron-reset` publication. **The loop must never be allowed to expire.**
+
+Do NOT preemptively shut down for context concerns — each tick is a fresh context. Only shut down on explicit user command (`/quit`, `/stop`, `/exit`).
+
+### Tick (cron-fired)
+
+Each tick is self-contained. It reads state from `/tmp/ongo_state.json`, executes, and writes state back.
+
+1. Read `/tmp/ongo_state.json` to recover CHANNEL, LAST_TS, rotation, idle, ken path, last_self_improve, cron_id, cron_created.
+2. **Cron renewal check**: if current time minus `cron_created` > 259200 (3 days), renew the cron job (CronDelete old, CronCreate new, update state, log to kendb as `ongo-cron-reset`).
+3. `clacks read -c "$CHANNEL" --after "$LAST_TS"` — on failure, log and exit tick.
+4. Filter out messages where `text` starts with `[ongo]` or `_[ongo]`. Sort remainder by `ts` ascending.
+5. **New messages**: send `_[ongo] Processing..._`, then for each: update LAST_TS to its `ts`, process it, respond via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`.
+6. **No new messages AND not idle**: run auto-expansion (see Auto-Expansion section).
+7. **24h since last_self_improve** (or user requested): run self-improvement, update last_self_improve.
+8. Write updated state back to `/tmp/ongo_state.json`.
 
 ### Shutdown
 
-On `/quit`, `/stop`, or `/exit`: send `_[ongo] Shutting down._` and stop.
+On `/quit`, `/stop`, or `/exit` in a user message:
+1. Send `_[ongo] Shutting down._`
+2. Read cron_id from `/tmp/ongo_state.json`
+3. Cancel the cron job via **CronDelete** with that ID
+4. Stop processing.
 
 ## Processing Messages
 
@@ -85,17 +156,31 @@ Interpret as natural language. The user might ask to:
 - **Trigger self-improvement** — run any single layer (A–E) or all
 - **Anything else** — use judgment
 
+Prefer delegating heavyweight research requests to subagents using the most capable available model (opus at time of writing — check for newer models during self-improvement) with the self-contextualization pattern below. Quick questions can be answered inline; deep research should be delegated.
+
 ## Auto-Expansion
 
-**Delegate to an intelligent subagent** using the most capable available model (opus at time of writing — check for newer models during self-improvement). The main loop stays lean — it only picks a topic and launches the agent. The subagent self-loads its own context from kendb.
+**Delegate to an intelligent subagent** using the most capable available model. The main loop stays lean — it only picks a topic, checks memory, and launches the agent. The subagent self-loads its own context from kendb.
 
-1. Load only the topic list and exploration directives (lightweight):
+**CRITICAL — Memory check before spawning subagents**: Before launching ANY subagent (auto-expansion or user-triggered), check available free memory via `free -m | awk '/^Mem:/ {print $7}'` (returns available MiB).
+
+Three thresholds:
+- **≥ 1024 MiB free**: normal operation, spawn any subagent (Sonnet or Opus).
+- **512–1023 MiB free**: memory pressure. Prefer Sonnet (smaller footprint) over Opus. Skip passive auto-expansion this tick; only honor user-triggered requests.
+- **< 512 MiB free**: critical. Do NOT spawn any subagent. Send `_[ongo] Memory pressure (< 512 MiB free) — deferring all subagent launches until next tick._` and skip the expansion step entirely for both user requests and passive research.
+
+**Re-tier up when pressure loosens**: these thresholds are checked *every* tick, not sticky. When free memory rises back above a threshold, resume normal operation for that tier on the very next tick — do not stay degraded after the pressure clears. The goal is to gate spawns by current conditions, not to lock ongo into a conservative mode after one bad reading.
+
+Rationale: subagents (especially Opus) have substantial memory footprints. Running under memory pressure risks OOM, which kills the whole session and breaks the loop. The loop must never stop — it is better to skip a tick than crash the agent.
+
+1. **Memory check**: `free -m | awk '/^Mem:/ {print $7}'` — apply the three-threshold rule above. Skip or downgrade as required.
+2. Load only the topic list and exploration directives (lightweight):
    ```bash
    ${CLAUDE_SKILL_DIR}/bin/ken list --kind ongo-exploration
    ${CLAUDE_SKILL_DIR}/bin/ken list --kind topic
    ```
-2. Pick a topic **randomly**, weighted by `ongo-exploration` directives. Skip if no topics.
-3. **Launch an Opus subagent** (via the Agent tool with `model: "opus"` and `run_in_background: true`) whose prompt contains only:
+3. Pick a topic **randomly**, weighted by `ongo-exploration` directives. Skip if no topics.
+4. **Launch a subagent** (via the Agent tool with the appropriate model for the current memory tier and `run_in_background: true`) whose prompt contains only:
    - The topic title and ID
    - The ken binary path: `${CLAUDE_SKILL_DIR}/bin/ken`
    - The clacks channel ID
@@ -123,9 +208,7 @@ Interpret as natural language. The user might ask to:
 >
 > (Replace KEN and CHANNEL with the actual paths/IDs provided.)
 
-4. Continue the main loop immediately — do NOT wait for the expansion agent to finish.
-
-**For processing user messages**: also prefer delegating heavyweight research requests to subagents (using the most capable available model) with the same self-contextualization pattern. Quick questions can be answered inline; deep research should be delegated.
+5. Continue the main loop immediately — do NOT wait for the expansion agent to finish.
 
 ## Self-Improvement
 
@@ -133,12 +216,12 @@ Every 24h or on request. Five layers, all run together:
 
 ### A. kendb maintenance
 
-- **Dedup** by key/URL/arxiv ID
+- **Dedup** by key/URL/arxiv ID — use `${CLAUDE_SKILL_DIR}/bin/ongo-delete` to remove duplicates after identifying them. Preview with `--dry-run` first, then delete the duplicate publication(s) keeping the one with richer notes/relationships.
 - **Gap filling** — implied relationships (depth 1, cap 20 per cycle)
 - **Surveys** — summary notes for topics with many publications
 - **Importance** — topic centrality by connection count
 - **Kind evolution** — new `pubkind` if needed
-- **Stale directives** — review `ongo-exploration`, flag outdated on Slack
+- **Stale directives** — review `ongo-exploration`, flag outdated on Slack. Use `ongo-delete pub --kind ongo-exploration` (with `--dry-run` first) to remove directives that are no longer relevant, or `ongo-delete pub <id>` to remove individual stale entries.
 
 ### B. Dependency updates
 
@@ -173,9 +256,25 @@ Review past attempts: `${CLAUDE_SKILL_DIR}/bin/ken list --kind ongo-self-improve
 
 File issues/PRs against tools (ken, clacks, etc.) when you hit bugs or missing features. Track as `ongo-self-improvement` entries keyed by issue/PR URL. On subsequent cycles, check status via `gh issue view`/`gh pr view` and update notes. Record rejection reasons to inform future attempts.
 
-**Constraints**: Do not remove shutdown commands, reduce polling below 1s, remove error handling, weaken dedup (`ts > LAST_TS` filter), or modify these constraints.
+**Constraints**: Do not remove shutdown commands, remove error handling, weaken dedup (`ts > LAST_TS` filter), or modify these constraints.
 
 ## Message Format
 
 - **Always** prepend `[ongo]` to every sent message — this is how the poll filter works. Omitting it causes an infinite loop.
 - Truncate responses over 30000 chars. Use `_..._` for status messages.
+
+## kendb Management Tools
+
+### ongo-delete
+
+`${CLAUDE_SKILL_DIR}/bin/ongo-delete` — delete publications and relationships from kendb. This is a stopgap until ken gains native delete support.
+
+```
+ongo-delete pub <id>              # Delete a publication (+ its relationships and notes)
+ongo-delete pub --key <key>       # Delete by key (URL, DOI, path, etc.)
+ongo-delete pub --kind <kind>     # Delete all publications of a kind
+ongo-delete rel <id>              # Delete a single relationship
+ongo-delete --dry-run ...         # Preview without deleting
+```
+
+Always use `--dry-run` first when deleting by `--kind` to avoid accidentally removing wanted entries. The script handles the ON DELETE RESTRICT constraint on relationships by deleting them before the publication.
