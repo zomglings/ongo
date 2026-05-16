@@ -4,86 +4,94 @@
 Usage:
     ongo-poll <CHANNEL> <LAST_USER_TS>
 
-Prints JSON:
-    {
-      "total_seen":     <int>,    # all messages gathered this poll
-      "user_count":     <int>,    # NEW user (non-[ongo]) messages
-      "newest_user_ts": "<str>",  # max ts among returned user msgs,
-                                  #   else LAST_USER_TS unchanged
-      "user_messages":  [ {"ts","text"}, ... ]   # ascending, ts > LAST_USER_TS
-    }
+Prints JSON. On success:
+    {"status":"ok","total_seen":N,"user_count":N,
+     "newest_user_ts":"<ts>","user_messages":[{"ts","text"},...]}
+On read failure (rate limit / API error / unparseable):
+    {"status":"error","error":"<msg>","user_count":0,
+     "newest_user_ts":"<LAST_USER_TS unchanged>","user_messages":[]}
 
-WHY THIS EXISTS — two bugs, fixed in two stages
-------------------------------------------------
-Stage 1 (original deaf-loop bug): `clacks read --after $ts` returns a
-bounded oldest-first slice anchored at `ts`, not a stream since `ts`.
-With the cursor frozen at session start it returned only old bot
-chatter; real user messages further ahead were never seen.
+THE CALLER MUST CHECK status. status=="error" means "could NOT read" —
+NOT "no new messages." On error the tick must report the failure and
+back off, never treat it as an idle/all-clear tick. That conflation is
+how the loop goes silently deaf.
 
-Stage 2 (the subtler bug this version fixes): the stage-1 fix advanced
-the cursor to the newest message *including the bot's own [ongo]
-sends*. A user message timestamped BEFORE one of the bot's sends but
-AFTER the previous cursor was then excluded by the `> cursor` filter on
-the next poll — silently missed, because the bot "spoke later."
+Bug history (each fix exposed the next):
+  1. Frozen cursor (advanced only on user msgs) -> deaf on idle channel.
+  2. Bot-contaminated cursor (advanced on bot sends) -> user msgs before
+     a later bot send filtered out.
+  3. Three reads/poll (recent+--since+--after) tripled
+     conversations.history volume; with 1-min fast-mode polling the
+     token hit HTTP-429 'ratelimited'. And every read was try/except ->
+     [] so a hard 429 read as "0 msgs, all clear" -> deaf again.
 
-THE INVARIANT
--------------
-The user-message gate must be `LAST_USER_TS` = ts of the most recent
-USER message actually processed. It advances ONLY when a user message
-is handled, and NEVER because the bot sent something. Bot/loop traffic
-is irrelevant to whether a user message is outstanding. Detection keys
-off LAST_USER_TS exclusively; there is no bot-contaminated cursor.
-
-Robustness: union three independent reads so a single capped/missed
-response can't hide a message — `recent` (latest-N head), a numeric
-`--since` window (clacks relative strings like "2 hours ago" silently
-return nothing — only epoch works), and `--after LAST_USER_TS`. Then
-filter to user messages with ts > LAST_USER_TS.
+In force now:
+  * Gate strictly on LAST_USER_TS (advances only on processed user
+    messages, never on bot traffic).
+  * ONE read per poll. Use `--since LAST_USER_TS` (semantically "at or
+    after this time"): a Slack ts is a valid --since value and this
+    returns the recent window correctly, unlike `--after` which returns
+    a bounded oldest-first slice anchored at the cursor. One API call.
+  * Distinguish FAILURE from EMPTY: detect non-JSON / traceback /
+    'ratelimited', retry with exponential backoff, else status=error.
 """
 import json
 import subprocess
 import sys
 import time
 
-WINDOW_SECONDS = 21600  # 6h numeric --since safety window
-LIM = "400"
+LIM = "200"
+BACKOFFS = (5, 15, 45)  # ~65s worst case before giving up
 
 
-def _run(args):
+def _read_once(channel, last_user_ts):
     try:
-        out = subprocess.run(["clacks"] + args, capture_output=True,
-                              text=True, timeout=60).stdout
-        return json.loads(out).get("messages", [])
+        p = subprocess.run(
+            ["clacks", "read", "-c", channel, "--since", last_user_ts,
+             "-l", LIM],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception as e:
+        return None, f"subprocess: {e}"
+    out, err = p.stdout.strip(), p.stderr.strip()
+    blob = out + "\n" + err
+    if "ratelimited" in blob or "SlackApiError" in blob \
+            or "Traceback" in blob:
+        return None, "ratelimited" if "ratelimited" in blob else "api-error"
+    try:
+        return json.loads(out).get("messages", []), None
     except Exception:
-        return []
+        return None, f"unparseable: {(out or err)[:120]}"
 
 
 def poll(channel, last_user_ts):
-    seen = {}
-    # 1. Latest-N head (proper primitive for "most recent messages").
-    for m in _run(["recent", "-c", channel, "-l", LIM]) \
-            or _run(["recent", "-l", LIM]):
-        seen[m.get("ts")] = m
-    # 2. Numeric-epoch window (relative strings return nothing in clacks).
-    since = str(int(time.time()) - WINDOW_SECONDS)
-    for m in _run(["read", "-c", channel, "--since", since, "-l", LIM]):
-        seen[m.get("ts")] = m
-    # 3. Explicit after-the-gate read.
-    for m in _run(["read", "-c", channel, "--after", last_user_ts,
-                    "-l", LIM]):
-        seen[m.get("ts")] = m
+    msgs, error = _read_once(channel, last_user_ts)
+    for delay in BACKOFFS:
+        if error is None:
+            break
+        time.sleep(delay)
+        msgs, error = _read_once(channel, last_user_ts)
 
-    allm = sorted((m for m in seen.values() if m.get("ts")),
-                  key=lambda m: m["ts"])
+    if error is not None:
+        return {
+            "status": "error",
+            "error": error,
+            "total_seen": 0,
+            "user_count": 0,
+            "newest_user_ts": last_user_ts,
+            "user_messages": [],
+        }
 
     def is_bot(m):
         return m.get("text", "").lstrip().startswith(("[ongo]", "_[ongo]"))
 
+    allm = sorted((m for m in msgs if m.get("ts")), key=lambda m: m["ts"])
+    # --since is inclusive; strictly exclude the gate message itself.
     users = [m for m in allm
              if not is_bot(m) and m.get("ts", "0") > last_user_ts]
     newest_user = max((m["ts"] for m in users), default=last_user_ts)
-
     return {
+        "status": "ok",
         "total_seen": len(allm),
         "user_count": len(users),
         "newest_user_ts": newest_user,
