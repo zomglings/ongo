@@ -135,6 +135,8 @@ When a tick (or a user request) implies more than one **independent** unit of wo
 - All spawns remain subject to the memory-tier gate (see Auto-Expansion). Within the allowed tier, prefer launching the user deliverable first, then the maintenance work, both in the background.
 - A user deliverable must never wait on unrelated maintenance. If both are due in one tick, the deliverable subagent is launched first and does not block on the rest.
 
+**Same-artifact work is NOT independent — never fan it out.** Two agents editing the same file/note/document concurrently is a race: the later writer silently clobbers the earlier, or you get a half-merged artifact. "Independent" means *disjoint artifacts*. If follow-up instructions arrive for work an agent is already doing (e.g. the user adds a requirement to a document being revised), **send them to the existing agent via SendMessage — do not spawn a second agent on the same file.** If an agent has already finished, launch a single successor that reads the current on-disk state and edits forward; do not launch two successors. One artifact ⇒ at most one writer in flight. Concurrency parallelizes across artifacts, never within one.
+
 ### Tick (cron-fired)
 
 Each tick is self-contained. It reads state from `/tmp/ongo_state.json`, executes, and writes state back.
