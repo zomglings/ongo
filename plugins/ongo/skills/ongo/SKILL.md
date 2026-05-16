@@ -74,6 +74,7 @@ Write initial state to `/tmp/ongo_state.json`:
   "rotation": "reference",
   "idle": false,
   "ken": "${CLAUDE_SKILL_DIR}/bin/ken",
+  "cron_id": null,
   "cron_created": <current unix epoch>,
   "normal_cron": "<computed cron expression from --interval>",
   "mode": "normal",
@@ -106,7 +107,7 @@ The tick prompt must be **self-contained** since each cron fire is a fresh conte
 > 6. **If 24h since last_self_improve**: run self-improvement cycle (layers A–E per SKILL.md).
 > 7. **On `/quit`, `/stop`, `/exit`**: send `_[ongo] Shutting down._`, delete the cron job via CronDelete, and stop.
 > 8. **Fast-mode transition** (see "Fast mode"): if `user_count > 0`, reset `fast_idle_polls=0` and enter fast mode (1-min cron) if currently normal; if `user_count == 0` and in fast mode, increment `fast_idle_polls` and exit to `normal_cron` after it reaches 5.
-> 9. **Only after every returned user message has been handled/dispatched**, set `last_user_ts = newest_user_ts` and write state back. If `user_count == 0`, leave `last_user_ts` unchanged. **Never** advance it past an unprocessed user message, and **never** advance it because the bot sent a message. Load-bearing: see "Polling correctly".
+> 9. Advance `last_user_ts` to the **longest fully-handled ascending prefix** of `user_messages` (the last message such that it and every earlier message was handled/dispatched-OK), then write state back — this equals `newest_user_ts` only if the whole batch succeeded; if a middle message failed, stop at the last good one *before the hole*. If `user_count == 0`, leave `last_user_ts` unchanged. **Never** advance past an unprocessed/failed user message, and **never** advance because the bot sent a message. A re-surfaced already-answered message is the accepted cost of never losing one. Load-bearing: see "Polling correctly".
 >
 > Always prepend `[ongo]` to every Slack message. Ken binary at: $KEN. Truncate responses over 30000 chars.
 
@@ -115,7 +116,7 @@ After creating the cron job, report:
 _[ongo] Research agent active — cron loop every N min. Session-only, auto-expires after 7 days._
 ```
 
-Store the cron job ID and creation timestamp in `/tmp/ongo_state.json` as `"cron_id"` and `"cron_created"` so it can be renewed and cancelled.
+The initial state above writes `"cron_id": null` (the cron does not exist yet at state-init time). Immediately after **CronCreate** succeeds, overwrite `"cron_id"` with the returned job ID and refresh `"cron_created"` to the creation epoch, then write state back, so the job can be renewed and cancelled. A tick that reads state and finds `cron_id == null` means CronCreate never completed — re-run startup step 5 rather than attempting renewal/shutdown against a nonexistent job.
 
 ## Main Loop
 
@@ -135,9 +136,15 @@ Do NOT preemptively shut down for context concerns — each tick is a fresh cont
 When a tick (or a user request) implies more than one **independent** unit of work — e.g. a user-facing deliverable plus loop/skill maintenance plus research expansion — launch a background subagent **per unit, in the same turn**, and continue immediately. Do **not** serialize independent tasks, and never let the loop's own bookkeeping (polling, state writes, repo/PR work, self-improvement layers) block or delay a user-facing deliverable.
 
 - The main loop is deliberately lean precisely so heavyweight work can be delegated and run concurrently. Underusing concurrency wastes that design and adds latency to things the user is waiting on.
-- Reserve serialization strictly for genuine **data dependencies** (B needs A's output). Absent that, fan out.
+- Serialize for **two** reasons only: a genuine **data dependency** (B needs A's output) **or** a **write conflict** (A and B mutate the same artifact). Absent both, fan out.
 - All spawns remain subject to the memory-tier gate (see Auto-Expansion). Within the allowed tier, prefer launching the user deliverable first, then the maintenance work, both in the background.
 - A user deliverable must never wait on unrelated maintenance. If both are due in one tick, the deliverable subagent is launched first and does not block on the rest.
+
+**Same-artifact work is NOT independent — never fan it out.** Two agents writing the same file/note/document/kendb publication concurrently is a race: the later writer silently clobbers the earlier, or you get a half-merged artifact. A data dependency is not required for this to be unsafe — two blind writers need nothing from each other and still corrupt the result. "Independent" means *disjoint write targets*.
+
+**Operational test — apply before every fan-out.** For each pair of units about to be launched in the same turn, enumerate the concrete artifacts each will *write*: file paths it will edit, kendb publication IDs/keys it will `add`/relate/`ongo-delete`, the SKILL.md self-modification file, the Slack channel state, `/tmp/ongo_state.json`. If the write-sets intersect (same path, same publication ID/key, same file), the units are **not** independent — collapse them into one agent. When in doubt, treat the artifact as shared and serialize; a missed parallelization costs latency, a missed conflict costs the artifact. Read-only overlap (both agents `ken list` the same kind) is fine; only overlapping **writes** force serialization.
+
+**Follow-ups to in-flight work.** If new instructions arrive for work an agent is already doing (e.g. the user adds a requirement to a document being revised, or a second message targets a note another tick's agent is writing), **send them to the existing agent via SendMessage — do not spawn a second agent on the same artifact.** If the agent has already finished, launch a *single* successor that reads the current on-disk/kendb state and edits forward; never launch two successors. One artifact ⇒ at most one writer in flight. Concurrency parallelizes across artifacts, never within one. This is the only safe way to honor "process every returned user message" (Tick step 5) when two messages in one batch touch the same artifact: they are processed in ascending order by the *same* writer, not by racing agents.
 
 ### Tick (cron-fired)
 
@@ -147,11 +154,11 @@ Each tick is self-contained. It reads state from `/tmp/ongo_state.json`, execute
 2. **Cron renewal check**: if current time minus `cron_created` > 259200 (3 days), renew the cron job (CronDelete old, CronCreate new, update state, log to kendb as `ongo-cron-reset`).
 3. Poll: `$SKILL_DIR/bin/ongo-poll "$CHANNEL" "$LAST_USER_TS"` — on failure, log and exit tick. Parse its JSON output.
 4. `user_messages` (bot-filtered, `ts > LAST_USER_TS`, ascending) are the messages to handle.
-5. **`user_count > 0`**: send `_[ongo] Processing..._`, then for **every** message in ascending order: process it (or dispatch a background agent for it), respond via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`. Do not skip any, even partially-handled ones.
+5. **`user_count > 0`**: send `_[ongo] Processing..._`, then for **every** message in ascending order: process it (or dispatch a background agent for it), respond via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`. Do not skip any, even partially-handled ones. **A message is "handled" only once it has either been answered inline or successfully dispatched to a background agent that acknowledged start.** If processing or dispatch of message *i* fails (exception, agent failed to launch, dispatch errored), stop treating later messages as gating: record the *highest ts that was fully handled with no unhandled message before it* — this, not `newest_user_ts`, is what step 9 may advance to. A dispatched agent that later *fails mid-work* re-surfaces its message next poll (it is still `> LAST_USER_TS` only if the gate was not advanced past it — see below); if the gate already advanced, the agent owns retry/error-reporting and must post the failure to Slack so the user can re-ask.
 6. **No user messages AND not idle**: run auto-expansion (see Auto-Expansion section).
 7. **24h since last_self_improve** (or user requested): run self-improvement, update last_self_improve.
 8. **Fast-mode transition** (see "Fast mode"): `user_count > 0` → `fast_idle_polls=0`, enter fast mode if normal; `user_count == 0` and fast → `fast_idle_polls++`, exit to `normal_cron` at 5.
-9. Only after **all** returned user messages are handled/dispatched, set `LAST_USER_TS = newest_user_ts` and write state back. If `user_count == 0`, leave `LAST_USER_TS` unchanged.
+9. Advance the gate to the **longest fully-handled ascending prefix**, never blindly to `newest_user_ts`. Concretely: walk `user_messages` ascending; set `LAST_USER_TS` to the ts of the last message such that *it and every message before it* was handled (step 5 definition). If the whole batch succeeded this equals `newest_user_ts`. If a middle message failed, the gate stays at the last good message *before the hole* — the failed message and everything after it stay outstanding and are re-polled next tick. **Never advance past a hole**, even though that means already-answered later messages in the same batch will be re-surfaced and re-answered (accepted: see "Reprocessing" below). If `user_count == 0`, leave `LAST_USER_TS` unchanged. Then write state back.
 
 ### Polling correctly
 
@@ -160,7 +167,9 @@ Each tick is self-contained. It reads state from `/tmp/ongo_state.json`, execute
 - **Capped slice.** `clacks read --after` returns a bounded *oldest-first* slice (~15–20 msgs) anchored at `--after`, not a stream of everything since. Once the bot's own `[ongo]` messages exceed that slice it is pure bot chatter and real user messages further ahead are never returned — the filter then truthfully reports "0 user messages" of a window that structurally cannot contain them.
 - **Bot-contaminated cursor.** The first fix advanced the cursor to the newest message *including the bot's own sends*. A user message timestamped before one of the bot's sends but after the previous cursor was then excluded by the `> cursor` filter next poll — silently missed because the bot "spoke later." This actually happened (four user messages lost in one busy turn).
 
-**The invariant.** The gate is `LAST_USER_TS` = ts of the most recent USER message *actually processed*. It advances **only** when user messages are handled, **never** because the bot sent something, and **never** past an unprocessed user message. There is no separate bot-influenced cursor — bot/loop traffic is irrelevant to whether a user message is outstanding. `bin/ongo-poll` takes `LAST_USER_TS`, unions three independent reads (`recent` latest-N head + numeric-epoch `--since` window [clacks relative strings like `"2 hours ago"` silently return nothing — only epoch works] + `--after`), and returns user messages with `ts > LAST_USER_TS`. Process the whole batch each tick in ascending order; only then advance `LAST_USER_TS` to `newest_user_ts`. "Every user message is eventually processed exactly once" is the invariant — not "ride the head of the channel."
+**The invariant.** The gate is `LAST_USER_TS` = ts of the most recent USER message *actually processed*. It advances **only** when user messages are handled, **never** because the bot sent something, and **never** past an unprocessed user message. There is no separate bot-influenced cursor — bot/loop traffic is irrelevant to whether a user message is outstanding. `bin/ongo-poll` takes `LAST_USER_TS`, unions three independent reads (`recent` latest-N head + numeric-epoch `--since` window [clacks relative strings like `"2 hours ago"` silently return nothing — only epoch works] + `--after`), and returns user messages with `ts > LAST_USER_TS`. Process the whole batch each tick in ascending order; only then advance `LAST_USER_TS` over the fully-handled prefix (Tick step 9). The real invariant is **at-least-once, never-lost**: "every user message is eventually processed" — *not* "exactly once." The gate trades duplicate work for zero loss, deliberately.
+
+**Reprocessing (accepted tradeoff).** Because the gate may only advance over a contiguous handled prefix and **never past an unprocessed (failed/held) message**, a later message in the same batch that *was* answered will be re-surfaced and re-answered on the next poll if an earlier message in that batch failed. This is not a bug — it is the chosen behavior, and it has been observed (a Markov-chain question got a second answer after an earlier message in its batch errored). Loss is unacceptable; a duplicate answer is merely noisy. Mitigations, in order: (a) make message handling **idempotent where cheap** — before answering, a handler may scan recent `[ongo]` sends for an answer it already posted to the same question and skip/acknowledge instead of recomputing; (b) keep batches small (fast mode shortens the poll window, shrinking batches and thus the reprocess blast radius); (c) when re-answering a known duplicate, prefix `_[ongo] (re-sending — earlier sibling in this batch failed)_` so the user understands the repeat. None of these may weaken rule: **the gate still never advances past the failed message.**
 
 There are deliberately **no per-topic scheduling fields** in state (e.g. no `last_<topic>_refresh`). Keeping any one topic current is the job of the directive-weighted auto-expansion in step 6, not bespoke per-topic timers — those don't generalize and put scheduling policy in state instead of in the loop.
 
