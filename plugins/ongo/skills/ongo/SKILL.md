@@ -75,6 +75,7 @@ Write initial state to `/tmp/ongo_state.json`:
   "idle": false,
   "ken": "${CLAUDE_SKILL_DIR}/bin/ken",
   "cron_created": <current unix epoch>,
+  "prev_cron_id": "",
   "normal_cron": "<computed cron expression from --interval>",
   "mode": "normal",
   "fast_idle_polls": 0
@@ -115,7 +116,7 @@ After creating the cron job, report:
 _[ongo] Research agent active — cron loop every N min. Session-only, auto-expires after 7 days._
 ```
 
-Store the cron job ID and creation timestamp in `/tmp/ongo_state.json` as `"cron_id"` and `"cron_created"` so it can be renewed and cancelled.
+Store the cron job ID and creation timestamp in `/tmp/ongo_state.json` as `"cron_id"` and `"cron_created"` so it can be renewed and cancelled. Initialize `"prev_cron_id"` to `""` (no swap has happened yet).
 
 ## Main Loop
 
@@ -126,7 +127,20 @@ The main loop is driven by **CronCreate** — each tick fires as an independent 
 - **Ticks fire at consistent wall-clock times** regardless of how long the previous tick took.
 - **Session-only** — the cron job dies when Claude exits. Auto-expires after 7 days.
 
-**CRITICAL — Cron renewal**: CronCreate jobs auto-expire after 7 days. To ensure ongo **never stops looping**, every tick must check `cron_created` in state. If 3 days (259200 seconds) have passed since cron creation, **renew the cron job**: delete the old one via CronDelete, create a fresh one via CronCreate with the same expression and prompt, update `cron_id` and `cron_created` in state. Track each renewal in kendb as an `ongo-cron-reset` publication. **The loop must never be allowed to expire.**
+**CRITICAL — Cron renewal**: CronCreate jobs auto-expire after 7 days. To ensure ongo **never stops looping**, every tick must check `cron_created` in state. If 3 days (259200 seconds) have passed since cron creation, **renew the cron job**. Track each renewal in kendb as an `ongo-cron-reset` publication. **The loop must never be allowed to expire.**
+
+**Safe cron-swap procedure (the canonical primitive — used by renewal AND every fast-mode mode change):** the swap is **create-then-delete**, in this exact order:
+
+1. `CronCreate` the new job (same tick prompt; new expression).
+2. **Only after** the new `cron_id` is in hand, write state to `/tmp/ongo_state.json`: set `cron_id` to the new id, set `cron_created`, copy the *previous* `cron_id` into `prev_cron_id`, and update `mode`/`fast_idle_polls`/`normal_cron` as applicable.
+3. `CronDelete` the **old** id. On success, clear `prev_cron_id` (write state). On failure, leave `prev_cron_id` set so the next tick retries.
+4. Log the `ongo-cron-reset` kendb entry (old id → new id, reason).
+
+**Stale-cron reconciliation (tick step 2, runs every tick before the renewal check):** if `prev_cron_id` is non-empty and not equal to the current `cron_id`, attempt `CronDelete prev_cron_id`; on success clear it. This guarantees that a tick which died mid-swap (leaving a duplicate) is self-healed by the *next* fire of either surviving cron — the transient duplicate is bounded to one tick interval.
+
+Rationale: each tick is an independent, killable context. **Never `CronDelete` before the replacement exists.** Delete-then-create has a fatal window: if the tick dies (or `CronCreate` fails) after the delete, there is **zero** cron left and nothing can recreate it — the loop is permanently dead. Create-then-delete fails safe: a crash in the window leaves a transient *duplicate* cron (both fire; reconciliation above deletes the stale id on the next tick), which is recoverable. A brief duplicate is acceptable; a gap is not.
+
+**Durability is uniform**: every `CronCreate` ongo issues — startup, renewal, fast-mode enter, fast-mode exit — uses the **same** `recurring: true` setting and makes **no** `durable` request. The harness treats these as session-scoped (they die when Claude exits and auto-expire after 7 days); the renewal logic depends only on the 7-day expiry, not on any cross-session durability guarantee. Do not request `durable` for some swaps and not others — mixed durability across the swap sites makes the renewal window non-uniform and the guarantee unanalyzable.
 
 Do NOT preemptively shut down for context concerns — each tick is a fresh context. Only shut down on explicit user command (`/quit`, `/stop`, `/exit`).
 
@@ -143,15 +157,16 @@ When a tick (or a user request) implies more than one **independent** unit of wo
 
 Each tick is self-contained. It reads state from `/tmp/ongo_state.json`, executes, and writes state back.
 
-1. Read `/tmp/ongo_state.json` to recover CHANNEL, LAST_USER_TS, rotation, idle, ken path, last_self_improve, cron_id, cron_created.
-2. **Cron renewal check**: if current time minus `cron_created` > 259200 (3 days), renew the cron job (CronDelete old, CronCreate new, update state, log to kendb as `ongo-cron-reset`).
-3. Poll: `$SKILL_DIR/bin/ongo-poll "$CHANNEL" "$LAST_USER_TS"` — on failure, log and exit tick. Parse its JSON output.
-4. `user_messages` (bot-filtered, `ts > LAST_USER_TS`, ascending) are the messages to handle.
-5. **`user_count > 0`**: send `_[ongo] Processing..._`, then for **every** message in ascending order: process it (or dispatch a background agent for it), respond via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`. Do not skip any, even partially-handled ones.
-6. **No user messages AND not idle**: run auto-expansion (see Auto-Expansion section).
-7. **24h since last_self_improve** (or user requested): run self-improvement, update last_self_improve.
-8. **Fast-mode transition** (see "Fast mode"): `user_count > 0` → `fast_idle_polls=0`, enter fast mode if normal; `user_count == 0` and fast → `fast_idle_polls++`, exit to `normal_cron` at 5.
-9. Only after **all** returned user messages are handled/dispatched, set `LAST_USER_TS = newest_user_ts` and write state back. If `user_count == 0`, leave `LAST_USER_TS` unchanged.
+1. Read `/tmp/ongo_state.json` to recover CHANNEL, LAST_USER_TS, rotation, idle, ken path, last_self_improve, cron_id, cron_created, prev_cron_id.
+2. **Stale-cron reconciliation**: if `prev_cron_id` is non-empty and ≠ `cron_id`, `CronDelete prev_cron_id`; on success clear `prev_cron_id` and write state. (Self-heals a duplicate left by a tick that died mid-swap; see "Cron renewal".)
+3. **Cron renewal check**: if current time minus `cron_created` > 259200 (3 days), renew the cron job via the **safe cron-swap procedure** (CronCreate new → write state → CronDelete old → log `ongo-cron-reset`; see "Cron renewal"). Never delete the old cron before the new one exists.
+4. Poll: `$SKILL_DIR/bin/ongo-poll "$CHANNEL" "$LAST_USER_TS"` — on failure, log and exit tick. Parse its JSON output.
+5. `user_messages` (bot-filtered, `ts > LAST_USER_TS`, ascending) are the messages to handle.
+6. **`user_count > 0`**: send `_[ongo] Processing..._`, then for **every** message in ascending order: process it (or dispatch a background agent for it), respond via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`. Do not skip any, even partially-handled ones.
+7. **No user messages AND not idle**: run auto-expansion (see Auto-Expansion section).
+8. **24h since last_self_improve** (or user requested): run self-improvement, update last_self_improve.
+9. **Fast-mode transition** (see "Fast mode"): `user_count > 0` → `fast_idle_polls=0`, enter fast mode if normal (no swap if already fast); `user_count == 0` and fast → `fast_idle_polls++`, exit to `normal_cron` at 5. Every mode change uses the **safe cron-swap procedure** (create-then-delete; see "Cron renewal").
+10. Only after **all** returned user messages are handled/dispatched, set `LAST_USER_TS = newest_user_ts` and write state back. If `user_count == 0`, leave `LAST_USER_TS` unchanged.
 
 ### Polling correctly
 
@@ -174,11 +189,15 @@ Cron expressions: normal = `normal_cron`; fast = `"* * * * *"` (every minute).
 
 Transition logic, evaluated every tick **after** polling and message handling, **before** the state write:
 
-- **`user_count > 0`** (the user said something): set `fast_idle_polls = 0`. If `mode == "normal"`, **enter fast mode**: `CronDelete` the current `cron_id`, `CronCreate` with `"* * * * *"` (recurring, durable) and the same tick prompt, update `cron_id`/`cron_created`, set `mode = "fast"`, log a `ongo-cron-reset` kendb entry noting the mode change.
-- **`user_count == 0` and `mode == "fast"`**: increment `fast_idle_polls`. If `fast_idle_polls >= 5`, **exit fast mode**: `CronDelete`, `CronCreate` with `normal_cron`, update `cron_id`/`cron_created`, set `mode = "normal"`, `fast_idle_polls = 0`, log `ongo-cron-reset`.
+- **`user_count > 0`** (the user said something): set `fast_idle_polls = 0`. If `mode == "normal"`, **enter fast mode**: perform the **safe cron-swap procedure** (see "Cron renewal") with the new expression `"* * * * *"` and the same tick prompt; also set `mode = "fast"` in the same state write. (`recurring: true`, no `durable` — same as every other CronCreate.) If `mode == "fast"` already, do **not** swap — only the `fast_idle_polls = 0` reset applies (no cron churn for an ongoing back-and-forth).
+- **`user_count == 0` and `mode == "fast"`**: increment `fast_idle_polls`. If `fast_idle_polls >= 5`, **exit fast mode**: perform the **safe cron-swap procedure** with the new expression `normal_cron`; in the same state write set `mode = "normal"` and `fast_idle_polls = 0`.
 - **`mode == "normal"` and `user_count == 0`**: nothing.
 
-Properties: entering fast mode is immediate on the first detected user message; a back-and-forth keeps resetting `fast_idle_polls` so the loop stays at 1-min cadence for the whole exchange; after 5 consecutive 1-min polls (~5 min) with silence it reverts. The cron-renewal check still applies to whichever cron is active. Fast-mode cron swaps are a normal part of operation and do not count against the 3-day renewal logic except that each swap resets `cron_created` (which is correct — it *is* a fresh cron).
+Properties: entering fast mode is immediate on the first detected user message; a back-and-forth keeps resetting `fast_idle_polls` (no extra cron swap — only the normal→fast and fast→normal edges swap) so the loop stays at 1-min cadence for the whole exchange; after 5 consecutive 1-min polls (~5 min) with silence it reverts.
+
+**Swap churn is bounded.** At most one cron swap per fast/normal *edge*: a sustained conversation triggers exactly one normal→fast swap, and reversion triggers exactly one fast→normal swap. Even a pathological pattern (one user message every ~6 min forever) is bounded to one pair of swaps per ~5-min reversion cycle — not per message — because the `mode == "fast"` guard above suppresses redundant swaps. This is safe given the create-then-delete primitive.
+
+**Renewal interaction (load-bearing).** Every swap *is* a fresh `CronCreate`, so it resets the new cron's own 7-day expiry clock — and `cron_created` is updated to match. A long-lived flapping session therefore keeps resetting `cron_created`, so the explicit 3-day renewal check may *never* fire. That is acceptable **only because** each swap is itself a real fresh cron that restarts the 7-day clock — i.e. swaps double as renewals. This makes the safe-swap primitive's create-then-delete ordering not merely advisory but **required**: a swap that deletes the old cron and then fails to create the new one leaves zero cron *and* a `cron_created` that no longer reflects reality, with no surviving cron to ever run the renewal check — unrecoverable. Never weaken the swap ordering.
 
 ### Shutdown
 
