@@ -53,6 +53,16 @@ ${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-self-improvement 2>/dev/null || ${
 ${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-cron-reset 2>/dev/null || ${CLAUDE_SKILL_DIR}/bin/ken pubkind add ongo-cron-reset "A record of a CronCreate renewal. The key is a timestamp. The title records the old and new cron job IDs. Ongo must renew its cron job every 3 days to prevent the 7-day auto-expiry from killing the loop."
 ```
 
+**Registration is not durable — every `ken add <customkind>` must be idempotent.** Startup registration above happens once, but each tick and each subagent runs in a fresh context and may operate against a kendb instance where the custom kind is not registered (this was observed in production: `ken add ongo-cron-reset` failed mid-run because the pubkind was missing from that kendb instance and had to be re-registered by hand). Therefore **never call `ken add <customkind> …` bare.** Always ensure the pubkind first, in the same step:
+
+```bash
+# Reusable pattern — use this everywhere a custom kind is written (ongo-exploration, ongo-self-improvement, ongo-cron-reset):
+${CLAUDE_SKILL_DIR}/bin/ken pubkind show <kind> 2>/dev/null || ${CLAUDE_SKILL_DIR}/bin/ken pubkind add <kind> "<description from startup>"
+${CLAUDE_SKILL_DIR}/bin/ken add <kind> -k "<key>" --title "<title>"
+```
+
+This guard is cheap (a `pubkind show` is local) and is the only thing that keeps cron-reset / self-improvement logging from silently failing on a re-initialized kendb. The standard `note`/`topic`/`arxiv`/`web` kinds are built into ken and do not need this guard.
+
 ### 4. Connect to Slack
 
 If no `--channel`, discover self-DM:
@@ -104,7 +114,7 @@ The tick prompt must be **self-contained** since each cron fire is a fresh conte
 > 4. **If `user_count > 0`**: send `_[ongo] Processing..._`, process **every** returned user message in ascending order (do not skip any, even if you also spawn a background agent for one).
 > 5. **If no user messages AND not idle**: run auto-expansion — pick a topic from kendb weighted by exploration directives, launch a background research subagent (rotate: reference/Sonnet → deep notes/Opus → survey/Opus). There are **no per-topic refresh fields**; a frequently-prioritized topic stays fresh purely via its directive weight.
 > 6. **If 24h since last_self_improve**: run self-improvement cycle (layers A–E per SKILL.md).
-> 7. **On `/quit`, `/stop`, `/exit`**: send `_[ongo] Shutting down._`, delete the cron job via CronDelete, and stop.
+> 7. **On `/quit`, `/stop`, `/exit`**: send `_[ongo] Shutting down._`, then CronDelete `cron_id` **and** sweep for orphan crons (any cron whose prompt begins `Run one ongo research agent tick.` — fast-mode/renewal swaps may have left a stale one), and stop. See "Shutdown".
 > 8. **Fast-mode transition** (see "Fast mode"): if `user_count > 0`, reset `fast_idle_polls=0` and enter fast mode (1-min cron) if currently normal; if `user_count == 0` and in fast mode, increment `fast_idle_polls` and exit to `normal_cron` after it reaches 5.
 > 9. **Only after every returned user message has been handled/dispatched**, set `last_user_ts = newest_user_ts` and write state back. If `user_count == 0`, leave `last_user_ts` unchanged. **Never** advance it past an unprocessed user message, and **never** advance it because the bot sent a message. Load-bearing: see "Polling correctly".
 >
@@ -126,7 +136,7 @@ The main loop is driven by **CronCreate** — each tick fires as an independent 
 - **Ticks fire at consistent wall-clock times** regardless of how long the previous tick took.
 - **Session-only** — the cron job dies when Claude exits. Auto-expires after 7 days.
 
-**CRITICAL — Cron renewal**: CronCreate jobs auto-expire after 7 days. To ensure ongo **never stops looping**, every tick must check `cron_created` in state. If 3 days (259200 seconds) have passed since cron creation, **renew the cron job**: delete the old one via CronDelete, create a fresh one via CronCreate with the same expression and prompt, update `cron_id` and `cron_created` in state. Track each renewal in kendb as an `ongo-cron-reset` publication. **The loop must never be allowed to expire.**
+**CRITICAL — Cron renewal**: CronCreate jobs auto-expire after 7 days. To ensure ongo **never stops looping**, every tick must check `cron_created` in state. If 3 days (259200 seconds) have passed since cron creation, **renew the cron job**: delete the old one via CronDelete, create a fresh one via CronCreate with the same expression and prompt, update `cron_id` and `cron_created` in state. Track each renewal in kendb as an `ongo-cron-reset` publication — **using the idempotent ensure-pubkind-then-add pattern from Startup step 3** (a fresh tick context may hit an uninitialized kendb; a bare `ken add ongo-cron-reset` will silently fail there, losing the renewal audit trail). **The loop must never be allowed to expire.**
 
 Do NOT preemptively shut down for context concerns — each tick is a fresh context. Only shut down on explicit user command (`/quit`, `/stop`, `/exit`).
 
@@ -145,7 +155,7 @@ Each tick is self-contained. It reads state from `/tmp/ongo_state.json`, execute
 
 1. Read `/tmp/ongo_state.json` to recover CHANNEL, LAST_USER_TS, rotation, idle, ken path, last_self_improve, cron_id, cron_created.
 2. **Cron renewal check**: if current time minus `cron_created` > 259200 (3 days), renew the cron job (CronDelete old, CronCreate new, update state, log to kendb as `ongo-cron-reset`).
-3. Poll: `$SKILL_DIR/bin/ongo-poll "$CHANNEL" "$LAST_USER_TS"` — on failure, log and exit tick. Parse its JSON output.
+3. Poll: `$SKILL_DIR/bin/ongo-poll "$CHANNEL" "$LAST_USER_TS"`. Parse its JSON output. **Check `status` first**: `status == "error"` means the poll could **not** read (rate limit / API error) — it is **not** "no new messages." On `status == "error"`, follow the rate-limit back-off in "Slack API rate-limit budget" (report, leave `LAST_USER_TS` unchanged, revert fast mode if active, end the tick) — never treat it as an idle/all-clear tick.
 4. `user_messages` (bot-filtered, `ts > LAST_USER_TS`, ascending) are the messages to handle.
 5. **`user_count > 0`**: send `_[ongo] Processing..._`, then for **every** message in ascending order: process it (or dispatch a background agent for it), respond via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`. Do not skip any, even partially-handled ones.
 6. **No user messages AND not idle**: run auto-expansion (see Auto-Expansion section).
@@ -180,13 +190,47 @@ Transition logic, evaluated every tick **after** polling and message handling, *
 
 Properties: entering fast mode is immediate on the first detected user message; a back-and-forth keeps resetting `fast_idle_polls` so the loop stays at 1-min cadence for the whole exchange; after 5 consecutive 1-min polls (~5 min) with silence it reverts. The cron-renewal check still applies to whichever cron is active. Fast-mode cron swaps are a normal part of operation and do not count against the 3-day renewal logic except that each swap resets `cron_created` (which is correct — it *is* a fresh cron).
 
+### Slack API rate-limit budget
+
+Slack rate-limits **per method, per workspace**. The two methods ongo uses:
+
+- `clacks read` → `conversations.history` — **Tier 3, ~50 requests/minute**.
+- `clacks send` → `chat.postMessage` — roughly **1 message/second sustained** per channel.
+
+**Calls per tick** (count them — this is load-bearing):
+
+| Operation | `read` calls | `send` calls |
+|---|---|---|
+| `ongo-poll` | 1 (up to 4 with internal back-off retries on 429/error) | 0 |
+| `_[ongo] Processing..._` | 0 | 1 (only if `user_count > 0`) |
+| Per user message reply | 0 | 1 × `user_count` |
+| Fast-mode / cron-reset status post | 0 | 0–1 |
+| Auto-expansion subagent report | 0 | 1 (idle ticks, async) |
+| Self-improvement reports (every 24h) | 0 | up to ~6 |
+
+A normal idle tick is **1 read + 0 sends**. A busy fast-mode tick with a 3-message burst is **1 read + 4 sends**.
+
+**The real incident**: an earlier design did 3 reads/poll and fast mode polled every 60s unconditionally; `3 reads × 60 polls/hr = 180 reads/hr` plus ad-hoc reads pushed `conversations.history` over Tier 3 and the token got HTTP-429 `ratelimited`, which the loop then mis-read as "0 messages, all clear" and went deaf. The poller is now **1 read/poll** with bounded exponential back-off, which fixes the volume. The remaining exposure is **cadence**, not volume:
+
+**Safe ceiling**: at 1 read/poll, even sustained 1-min fast-mode polling is `60 reads/hr` — well under Tier 3's ~3000/hr. The budget is comfortable **as long as the poller stays at one read per poll and the back-off is respected**. Do not reintroduce multi-read polling, and do not add ad-hoc `clacks read` calls outside `bin/ongo-poll`.
+
+**Rate-limit-aware back-off (cadence)**: if `ongo-poll` returns `status == "error"` with `error == "ratelimited"` (the poller has already exhausted its internal ~65s back-off), the tick **must not** treat it as idle and **must not** keep hammering at the current cadence:
+
+1. Report `_[ongo] Slack rate-limited — backing off, will retry next tick._` (a single `send`; skip even this if the rate limit is on `chat.postMessage`).
+2. Leave `LAST_USER_TS` unchanged (unread window is unknown — see "Polling correctly").
+3. **If `mode == "fast"`**: immediately revert to `normal_cron` for this back-off (CronDelete + CronCreate with `normal_cron`, set `mode = "normal"`, `fast_idle_polls = 0`, log `ongo-cron-reset`). A 60s cadence is what produced the 429 in the first place; backing the cadence off to the normal interval is the correct response, and a genuine subsequent user message will re-enter fast mode normally.
+4. Do not advance any cron-renewal or self-improvement work this tick.
+
+This makes fast mode rate-limit-aware: it accelerates for live conversations but yields the moment Slack signals overload, instead of compounding the problem.
+
 ### Shutdown
 
 On `/quit`, `/stop`, or `/exit` in a user message:
 1. Send `_[ongo] Shutting down._`
-2. Read cron_id from `/tmp/ongo_state.json`
-3. Cancel the cron job via **CronDelete** with that ID
-4. Stop processing.
+2. Read `cron_id` from `/tmp/ongo_state.json`.
+3. Cancel the cron job via **CronDelete** with that ID.
+4. **Defensively sweep for orphans.** `cron_id` is rewritten on every fast-mode swap and every 3-day renewal (CronDelete-then-CronCreate). If a previous swap was interrupted between the delete and the state write, a stale ongo cron can still be live with an ID no longer in state. List all cron jobs and CronDelete any whose prompt is the ongo tick prompt (it begins with `Run one ongo research agent tick.`), not only the one recorded in state. Shutting down while leaving an orphan cron alive means the loop never actually stops.
+5. Stop processing.
 
 ## Processing Messages
 
@@ -285,6 +329,8 @@ Merge latest upstream SKILL.md into local copy, preserving local improvements.
 ### D. Self-modification
 
 Review past attempts: `${CLAUDE_SKILL_DIR}/bin/ken list --kind ongo-self-improvement`
+
+(Every `ken add ongo-self-improvement` and `ken add ongo-cron-reset` below — and the upstream-sync record in layer C — must use the idempotent ensure-pubkind-then-add pattern from Startup step 3, since this layer also runs in a fresh tick context.)
 
 1. Record plan: `${CLAUDE_SKILL_DIR}/bin/ken add ongo-self-improvement -k "<timestamp>-<label>" --title "<what will change>"`
 2. Backup: `cp ${CLAUDE_SKILL_DIR}/SKILL.md ${CLAUDE_SKILL_DIR}/SKILL.md.bak`
