@@ -22,7 +22,7 @@ The generator:
   3. Emits the index as a SINGLE GLOBAL FLAT LIST of every published item
      (no topic grouping, no per-topic nav): reverse-chronological (newest
      first), ties broken alphabetically by title (A->Z). Each row shows the
-     item's derived date. See `derive_item_date` for the date rule.
+     item's `created_at` (printed verbatim).
   4. Renders each article with a per-article table of contents built from
      its Markdown headings (anchor ids + links), auto-links bare http/https
      URLs (external links get target=_blank rel=noopener), and renders
@@ -1177,93 +1177,19 @@ def slugify(text, fallback):
     return s[:80] if s else fallback
 
 
-_MONTHS = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
-}
-# YYYYMMDD or YYYY-MM-DD / YYYY_MM_DD anywhere in the key (e.g.
-# `note-20260517-foo`, `2026-05-17-clacks`). Day is optional.
-_KEY_DATE = re.compile(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})?")
-# "May 2026", "Apr. 2026", "September 2026" in a title.
-_TITLE_DATE = re.compile(
-    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{4})",
-    re.I,
-)
-
-
 def _invert_date(iso):
-    """Map an ISO `YYYY-MM-DD` date to a key that sorts DESCENDING.
+    """Map a `YYYY-MM-DD HH:MM:SS` string to a key that sorts DESCENDING.
 
     Each digit d is replaced by (9 - d); non-digits pass through. A later
-    date thus yields a lexicographically smaller key, so a single ascending
-    sort places newer items first. Deterministic and total.
+    timestamp thus yields a lexicographically smaller key, so a single
+    ascending sort places newer items first. Inputs are ken's 19-char
+    `YYYY-MM-DD HH:MM:SS` `created_at` (or the `0000-00-00 00:00:00`
+    sentinel for missing rows), so the mapping is length-uniform and
+    ordering is total.
     """
     return "".join(
         str(9 - int(ch)) if ch.isdigit() else ch for ch in (iso or "")
     )
-
-
-def derive_item_date(key, title, created_at):
-    """Derive a (sort_key, label) pair for an item's date.
-
-    Date rule (documented & deterministic), in priority order:
-      1. The target note's `key` if it encodes a date: a `YYYYMMDD` or
-         `YYYY-MM-DD` / `YYYY_MM_DD` run anywhere in the key (the day is
-         optional; missing day -> the 1st). Validated as a real date.
-      2. Else a Month-Year in the title (e.g. "May 2026", "Apr. 2026");
-         day defaults to the 1st.
-      3. Else fall back to the publication's `created_at` timestamp
-         (its leading `YYYY-MM-DD`), or "0000-00-00" if even that is
-         absent. This is stable across runs (created_at never changes),
-         so ordering stays deterministic.
-
-    sort_key is an ISO `YYYY-MM-DD` string (lexicographic == chronological);
-    label is a human "Mon YYYY" / "Mon D, YYYY" string for the index row.
-    """
-    def _ok(y, mo, d):
-        return 1900 <= y <= 2999 and 1 <= mo <= 12 and 1 <= d <= 31
-
-    def _label(y, mo, d, with_day):
-        name = [k for k, v in _MONTHS.items() if v == mo][0].capitalize()
-        return ("%s %d, %d" % (name, d, y)) if with_day \
-            else ("%s %d" % (name, y))
-
-    # Every item gets a PRECISE (day-level) date. Priority:
-    # 1. a full YYYY-MM-DD encoded in the key (has explicit day).
-    if key:
-        m = _KEY_DATE.search(key)
-        if m and m.group(3) is not None:
-            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            if _ok(y, mo, d):
-                return ("%04d-%02d-%02d" % (y, mo, d),
-                        _label(y, mo, d, True))
-
-    # 2. the publication's created_at (always present, exact to the day,
-    #    stable across runs -> precise + deterministic).
-    if created_at:
-        m = re.match(r"\s*(\d{4})-(\d{2})-(\d{2})", str(created_at))
-        if m:
-            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            if _ok(y, mo, d):
-                return ("%04d-%02d-%02d" % (y, mo, d),
-                        _label(y, mo, d, True))
-
-    # 3. last resort only if created_at is somehow absent: month from
-    #    key or title (day -> 1st), still rendered with a day.
-    if key:
-        m = _KEY_DATE.search(key)
-        if m:
-            y, mo = int(m.group(1)), int(m.group(2))
-            if _ok(y, mo, 1):
-                return ("%04d-%02d-01" % (y, mo), _label(y, mo, 1, True))
-    if title:
-        m = _TITLE_DATE.search(title)
-        if m:
-            mo = _MONTHS[m.group(1).lower()[:3]]
-            y = int(m.group(2))
-            if _ok(y, mo, 1):
-                return ("%04d-%02d-01" % (y, mo), _label(y, mo, 1, True))
-    return ("0000-00-00", "Undated")
 
 
 def render_toc(toc, title="Contents"):
@@ -1570,39 +1496,44 @@ def _build_into(args, out_dir, work_dir):
 
         display = nav_title or (pub["title"] or "Untitled")[:120]
         slug = slugify(display, pub["id"][:8])
-        # Derive a deterministic date from key / title / created_at.
-        # `created_at` may be absent from a Row when keyed differently;
-        # access defensively.
+        # Derive a deterministic date from `created_at`. The column
+        # may be absent from a Row when keyed differently; access
+        # defensively.
         try:
             created_at = pub["created_at"]
         except (IndexError, KeyError):
             created_at = None
-        date_key, date_label = derive_item_date(
-            pub["key"] or "", display, created_at
-        )
+        # sort_ts == display label == created_at unchanged: ken's
+        # `YYYY-MM-DD HH:MM:SS` already sorts lexicographically and is
+        # what we want shown in the index. The fallback string sinks
+        # missing-created_at rows to the bottom of the global order.
+        sort_ts = created_at or "0000-00-00 00:00:00"
+        date_label = sort_ts
         items[pub["id"]] = {
             "pub_id": pub["id"],
             "display": display,
             "slug": slug,
             "source": source,
-            "date_key": date_key,
             "date_label": date_label,
+            "sort_ts": sort_ts,
             "page_path": f"items/{slug}.html",
         }
 
     if not items:
         log.append("  no resolvable published items — site will be empty")
 
-    # Single global reverse-chronological order (newest date first); ties
-    # within the same date broken alphabetically by title (A->Z). This ONE
-    # ordering drives both the flat index and the inter-article prev/next
-    # pager. `_invert_date` maps the ISO date to a string that sorts in
+    # Single global reverse-chronological order (newest first); ordered by
+    # full `YYYY-MM-DD HH:MM:SS` timestamp so multiple items published on
+    # the same date sort by time-of-day (newest first). Ties at the same
+    # second are broken alphabetically by title (A->Z). This ONE ordering
+    # drives both the flat index and the inter-article prev/next pager.
+    # `_invert_date` maps the timestamp to a string that sorts in
     # DESCENDING chronological order, so a single ascending sort gives
-    # newest-first dates while the forward (lowercased) title keeps ties
-    # A->Z. Deterministic and stable across runs.
+    # newest-first while the forward (lowercased) title keeps same-second
+    # ties A->Z. Deterministic and stable across runs.
     global_order = sorted(
         items.values(),
-        key=lambda x: (_invert_date(x["date_key"]), x["display"].lower()),
+        key=lambda x: (_invert_date(x["sort_ts"]), x["display"].lower()),
     )
 
     # Build a published-set lookup for cross-link resolution.
