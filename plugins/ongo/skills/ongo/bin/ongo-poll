@@ -39,12 +39,21 @@ Bug history (each fix exposed the next):
      [] so a hard 429 read as "0 msgs, all clear" -> deaf again.
   4. Single capped read silently truncates. `clacks read --since T
      -l 200` calls Slack conversations.history(oldest=T, limit=200)
-     with NO pagination; Slack returns the NEWEST 200 in the window
-     and DROPS the oldest. If >200 messages arrive between polls the
-     oldest unprocessed USER messages vanish, yet the cursor still
-     advanced to the newest -> those messages are skipped forever.
-     Recreates "silently deaf" under burst load. Now detected and
-     surfaced as status=="truncated" with a safe re-poll anchor.
+     with NO pagination. EMPIRICAL behavior (verified 2026-05-19 vs
+     a real channel): with oldest=T and latest unset Slack returns
+     the OLDEST page first (ascending from T, up to limit) and sets
+     has_more=true if newer messages remain. So the failure mode is
+     reversed from the original commentary: the NEWEST unprocessed
+     user messages vanish, not the oldest. Worse: Slack can return
+     FAR fewer than limit (e.g. 15/200) under tier-3 throttling /
+     server-side page slicing while still setting has_more=true. The
+     old `len >= LIM` saturation check therefore *never fires* on
+     short-but-incomplete pages, so the poll returned status="ok"
+     and the loop happily marked the channel drained while a queued
+     user message sat one page forward. Now the truncation branch
+     fires on either condition (len >= LIM OR has_more==true) and
+     advances the cursor FORWARD to newest_returned so the next poll
+     picks up the missing page.
 
 In force now:
   * Gate strictly on LAST_USER_TS (advances only on processed user
@@ -85,7 +94,7 @@ def _read_once(channel, last_user_ts):
             capture_output=True, text=True, timeout=60,
         )
     except Exception as e:
-        return None, f"subprocess: {e}"
+        return None, False, f"subprocess: {e}"
     out, err = p.stdout.strip(), p.stderr.strip()
     # Parse first. NEVER substring-scan the blob — message bodies (incl.
     # ongo's own status posts) legitimately contain "ratelimited" etc.
@@ -94,27 +103,27 @@ def _read_once(channel, last_user_ts):
     except Exception:
         # Not JSON at all -> a real failure. Inspect stderr only.
         if "ratelimited" in err:
-            return None, "ratelimited"
+            return None, False, "ratelimited"
         if "SlackApiError" in err or "Traceback" in err:
-            return None, "api-error"
-        return None, f"unparseable: {(err or out)[:120]}"
+            return None, False, "api-error"
+        return None, False, f"unparseable: {(err or out)[:120]}"
     if isinstance(data, dict) and data.get("ok") is False:
-        return None, data.get("error", "api-error")
+        return None, False, data.get("error", "api-error")
     if isinstance(data, dict) and "messages" in data:
-        return data["messages"], None
+        return data["messages"], bool(data.get("has_more")), None
     if isinstance(data, list):
-        return data, None
+        return data, False, None
     # Parsed JSON but unexpected shape — treat as empty success.
-    return [], None
+    return [], False, None
 
 
 def poll(channel, last_user_ts):
-    msgs, error = _read_once(channel, last_user_ts)
+    msgs, has_more, error = _read_once(channel, last_user_ts)
     for delay in BACKOFFS:
         if error is None:
             break
         time.sleep(delay)
-        msgs, error = _read_once(channel, last_user_ts)
+        msgs, has_more, error = _read_once(channel, last_user_ts)
 
     if error is not None:
         return {
@@ -138,21 +147,23 @@ def poll(channel, last_user_ts):
              if not is_bot(m) and m.get("ts", "0") > last_user_ts]
     newest_user = max((m["ts"] for m in users), default=last_user_ts)
 
-    # Saturation: clacks issues ONE non-paginated conversations.history
-    # with limit=LIM. If the window held >= LIM messages, Slack returned
-    # only the NEWEST LIM and silently dropped everything older. Any user
-    # message older than the oldest returned message is now invisible.
-    # Advancing the cursor to newest_user would skip them forever, so we
-    # surface status=="truncated" and hand back a SAFE anchor: just below
-    # the oldest message we actually saw. The next poll's --since window
-    # then starts there and re-pulls the dropped older slice (the already
-    # handled newer messages may be re-seen — at-least-once delivery is
-    # the only gap-free contract possible without pagination).
-    if len(allm) >= int(LIM):
-        oldest_ts = allm[0]["ts"]
-        try:
-            safe_anchor = f"{float(oldest_ts) - 1e-6:.6f}"
-        except (TypeError, ValueError):
+    # Saturation. Slack's conversations.history(oldest=T, latest=unset,
+    # limit=LIM) returns the OLDEST page (ascending from T) capped by
+    # limit, and sets has_more=true if newer messages remain. Empirically
+    # Slack can also short-page (return far fewer than LIM with
+    # has_more=true) under tier-3 throttling / server-side slicing. So
+    # we trip the truncated branch on EITHER condition — len >= LIM, or
+    # has_more==true — and advance the cursor FORWARD to the newest
+    # returned ts so the next poll picks up the missing newer slice.
+    # Process whatever user messages are in this page now; the cursor's
+    # strict `> last_user_ts` filter prevents re-emission, so the only
+    # at-least-once cost is that the anchor message itself (which our
+    # bot/ts filters reject anyway) may be re-seen by the next read.
+    if len(allm) >= int(LIM) or has_more:
+        if allm:
+            newest_seen = allm[-1]["ts"]
+            safe_anchor = newest_seen
+        else:
             safe_anchor = last_user_ts
         # Never move the cursor backwards past the caller's gate.
         if safe_anchor < last_user_ts:
