@@ -1,6 +1,6 @@
 ---
 name: ongo
-version: 0.3.14
+version: 0.3.15
 description: >-
   Autonomous research agent. Polls Slack for research requests, tracks findings
   in kendb, expands research when idle, and self-improves on a 24-hour cycle.
@@ -108,6 +108,7 @@ Create the cron job using **CronCreate**:
 ```
 cron: "<computed expression>"
 recurring: true
+durable: true
 prompt: <THE TICK PROMPT — see below>
 ```
 
@@ -159,7 +160,7 @@ The main loop is driven by **CronCreate** — each tick fires as an independent 
 
 Rationale: each tick is an independent, killable context. **Never `CronDelete` before the replacement exists.** Delete-then-create has a fatal window: if the tick dies (or `CronCreate` fails) after the delete, there is **zero** cron left and nothing can recreate it — the loop is permanently dead. Create-then-delete fails safe: a crash in the window leaves a transient *duplicate* cron (both fire; reconciliation above deletes the stale id on the next tick), which is recoverable. A brief duplicate is acceptable; a gap is not.
 
-**Durability is uniform**: every `CronCreate` ongo issues — startup, renewal, fast-mode enter, fast-mode exit — uses the **same** `recurring: true` setting and makes **no** `durable` request. The harness treats these as session-scoped (they die when Claude exits and auto-expire after 7 days); the renewal logic depends only on the 7-day expiry, not on any cross-session durability guarantee. Do not request `durable` for some swaps and not others — mixed durability across the swap sites makes the renewal window non-uniform and the guarantee unanalyzable.
+**Durability is uniform**: every `CronCreate` ongo issues — startup, renewal, fast-mode enter, fast-mode exit — uses the **same** `recurring: true` **and `durable: true`** settings. `durable: true` writes the job to `.claude/scheduled_tasks.json` so it survives Claude restarts (a `/exit`, a `/model` swap that restarts the REPL, a crash, anything short of an OS reboot that also wipes the harness state dir). The 7-day API expiry still applies — durability is *across sessions*, not *across the 7-day ceiling* — so the renewal check at "Cron renewal" remains required. The previous policy of `durable: false` was a hole: a session restart that did **not** route through ongo's `/quit` handler (any normal `/exit`, `/clear`, model swap) silently killed the cron, the new session inherited no cron, and renewal could not fire because there was no tick context to fire it from. Do not request `durable` for some swaps and not others — mixed durability across the swap sites makes the cross-session guarantee non-uniform and unanalyzable.
 
 Do NOT preemptively shut down for context concerns — each tick is a fresh context. Only shut down on explicit user command (`/quit`, `/stop`, `/exit`).
 
@@ -223,7 +224,7 @@ Cron expressions: normal = `normal_cron`; fast = `"* * * * *"` (every minute).
 
 Transition logic, evaluated every tick **after** polling and message handling, **before** the state write:
 
-- **`user_count > 0`** (the user said something) or `status == "truncated"`: set `fast_idle_polls = 0`. If `mode == "normal"`, **enter fast mode**: perform the **safe cron-swap procedure** (see "Cron renewal") with the new expression `"* * * * *"` and the same tick prompt; also set `mode = "fast"` in the same state write. (`recurring: true`, no `durable` — same as every other CronCreate.) If `mode == "fast"` already, do **not** swap — only the `fast_idle_polls = 0` reset applies (no cron churn for an ongoing back-and-forth).
+- **`user_count > 0`** (the user said something) or `status == "truncated"`: set `fast_idle_polls = 0`. If `mode == "normal"`, **enter fast mode**: perform the **safe cron-swap procedure** (see "Cron renewal") with the new expression `"* * * * *"` and the same tick prompt; also set `mode = "fast"` in the same state write. (`recurring: true`, `durable: true` — same as every other CronCreate.) If `mode == "fast"` already, do **not** swap — only the `fast_idle_polls = 0` reset applies (no cron churn for an ongoing back-and-forth).
 - **`user_count == 0` and `status == "ok"` and `mode == "fast"`**: increment `fast_idle_polls`. If `fast_idle_polls >= 5`, **exit fast mode**: perform the **safe cron-swap procedure** with the new expression `normal_cron`; in the same state write set `mode = "normal"` and `fast_idle_polls = 0`.
 - **`mode == "normal"` and `user_count == 0`**: nothing.
 - **`status == "error"`**: no fast-mode transition counter change; if `error == "ratelimited"` and `mode == "fast"`, revert to `normal_cron` per "Slack API rate-limit budget".
