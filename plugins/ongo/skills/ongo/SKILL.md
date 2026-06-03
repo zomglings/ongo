@@ -1,6 +1,6 @@
 ---
 name: ongo
-version: 0.3.9
+version: 0.3.10
 description: >-
   Autonomous research agent. Polls Slack for research requests, tracks findings
   in kendb, expands research when idle, and self-improves on a 24-hour cycle.
@@ -51,7 +51,7 @@ ${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-self-improvement 2>/dev/null || ${
 ```
 
 ```bash
-${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-cron-reset 2>/dev/null || ${CLAUDE_SKILL_DIR}/bin/ken pubkind add ongo-cron-reset "A record of a CronCreate renewal. The key is a timestamp. The title records the old and new cron job IDs. Ongo must renew its cron job every 3 days to prevent the 7-day auto-expiry from killing the loop."
+${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-cron-reset 2>/dev/null || ${CLAUDE_SKILL_DIR}/bin/ken pubkind add ongo-cron-reset "A record of a CronCreate renewal. The key is a timestamp. The title records the old and new cron job IDs. Ongo must renew its cron job every 3.5 days (half the 7-day auto-expiry) to prevent the loop from dying."
 ```
 
 ```bash
@@ -146,7 +146,7 @@ The main loop is driven by **CronCreate** — each tick fires as an independent 
 - **Ticks fire at consistent wall-clock times** regardless of how long the previous tick took.
 - **Session-only** — the cron job dies when Claude exits. Auto-expires after 7 days.
 
-**CRITICAL — Cron renewal**: CronCreate jobs auto-expire after 7 days. To ensure ongo **never stops looping**, every tick must check `cron_created` in state. If 3 days (259200 seconds) have passed since cron creation, **renew the cron job**. Track each renewal in kendb as an `ongo-cron-reset` publication — **using the idempotent ensure-pubkind-then-add pattern from Startup step 3** (a fresh tick context may hit an uninitialized kendb; a bare `ken add ongo-cron-reset` will silently fail there, losing the renewal audit trail). **The loop must never be allowed to expire.**
+**CRITICAL — Cron renewal**: CronCreate jobs auto-expire after 7 days. To ensure ongo **never stops looping**, every tick must check `cron_created` in state. If **3.5 days (302400 seconds — half the 7-day expiry)** have passed since cron creation, **renew the cron job**. The renewal threshold is deliberately set at *expiration/2* so the loop has a full half-expiry of slack to actually fire the renewal tick (the user explicitly chose this margin after a session restart killed an un-renewed cron); a shorter threshold churns crons unnecessarily, a longer one risks a missed tick (e.g. a multi-day stall, a temporarily-paused REPL) racing the 7-day cliff. Track each renewal in kendb as an `ongo-cron-reset` publication — **using the idempotent ensure-pubkind-then-add pattern from Startup step 3** (a fresh tick context may hit an uninitialized kendb; a bare `ken add ongo-cron-reset` will silently fail there, losing the renewal audit trail). **The loop must never be allowed to expire.**
 
 **Safe cron-swap procedure (the canonical primitive — used by renewal AND every fast-mode mode change):** the swap is **create-then-delete**, in this exact order:
 
@@ -184,7 +184,7 @@ Each tick is self-contained. It reads state from `/tmp/ongo_state.json`, execute
 
 1. Read `/tmp/ongo_state.json` to recover CHANNEL, LAST_USER_TS, rotation, idle, ken path, last_self_improve, cron_id, cron_created, prev_cron_id.
 2. **Stale-cron reconciliation**: if `prev_cron_id` is non-empty and ≠ `cron_id`, `CronDelete prev_cron_id`; on success clear `prev_cron_id` and write state. (Self-heals a duplicate left by a tick that died mid-swap; see "Cron renewal".)
-3. **Cron renewal check**: if current time minus `cron_created` > 259200 (3 days), renew the cron job via the **safe cron-swap procedure** (CronCreate new → write state → CronDelete old → log `ongo-cron-reset`; see "Cron renewal"). Never delete the old cron before the new one exists.
+3. **Cron renewal check**: if current time minus `cron_created` > 302400 (3.5 days — half the 7-day expiry; see "Cron renewal" for why expiration/2), renew the cron job via the **safe cron-swap procedure** (CronCreate new → write state → CronDelete old → log `ongo-cron-reset`; see "Cron renewal"). Never delete the old cron before the new one exists.
 4. Poll: `$SKILL_DIR/bin/ongo-poll "$CHANNEL" "$LAST_USER_TS"`. Parse its JSON and **branch on `status`** (this check is load-bearing — a missing-status check is exactly how the loop went silently deaf historically):
    - `status == "error"`: read **failed** (rate limit / API error). Send `_[ongo] Poll failed (<error>) — backing off._`, leave `LAST_USER_TS` unchanged, **skip steps 6–9** (no expansion, no fast-mode counter change). If `error == "ratelimited"`, additionally follow the cadence back-off in "Slack API rate-limit budget" (revert fast mode if active). End tick.
    - `status == "truncated"`: read succeeded but window saturated (>200 msgs; Slack dropped oldest). Handle returned messages (step 6), set `LAST_USER_TS = newest_user_ts` (the poller's safe earlier anchor), and force a re-poll (stay in / enter fast mode) until a `status == "ok"` poll. Never treat as idle.
@@ -232,7 +232,7 @@ Properties: entering fast mode is immediate on the first detected user message; 
 
 **Swap churn is bounded.** At most one cron swap per fast/normal *edge*: a sustained conversation triggers exactly one normal→fast swap, and reversion triggers exactly one fast→normal swap. Even a pathological pattern (one user message every ~6 min forever) is bounded to one pair of swaps per ~5-min reversion cycle — not per message — because the `mode == "fast"` guard above suppresses redundant swaps. This is safe given the create-then-delete primitive.
 
-**Renewal interaction (load-bearing).** Every swap *is* a fresh `CronCreate`, so it resets the new cron's own 7-day expiry clock — and `cron_created` is updated to match. A long-lived flapping session therefore keeps resetting `cron_created`, so the explicit 3-day renewal check may *never* fire. That is acceptable **only because** each swap is itself a real fresh cron that restarts the 7-day clock — i.e. swaps double as renewals. This makes the safe-swap primitive's create-then-delete ordering not merely advisory but **required**: a swap that deletes the old cron and then fails to create the new one leaves zero cron *and* a `cron_created` that no longer reflects reality, with no surviving cron to ever run the renewal check — unrecoverable. Never weaken the swap ordering.
+**Renewal interaction (load-bearing).** Every swap *is* a fresh `CronCreate`, so it resets the new cron's own 7-day expiry clock — and `cron_created` is updated to match. A long-lived flapping session therefore keeps resetting `cron_created`, so the explicit 3.5-day renewal check may *never* fire. That is acceptable **only because** each swap is itself a real fresh cron that restarts the 7-day clock — i.e. swaps double as renewals. This makes the safe-swap primitive's create-then-delete ordering not merely advisory but **required**: a swap that deletes the old cron and then fails to create the new one leaves zero cron *and* a `cron_created` that no longer reflects reality, with no surviving cron to ever run the renewal check — unrecoverable. Never weaken the swap ordering.
 
 ### Slack API rate-limit budget
 
@@ -273,7 +273,7 @@ On `/quit`, `/stop`, or `/exit` in a user message:
 1. Send `_[ongo] Shutting down._`
 2. Read `cron_id` from `/tmp/ongo_state.json`.
 3. Cancel the cron job via **CronDelete** with that ID.
-4. **Defensively sweep for orphans.** `cron_id` is rewritten on every fast-mode swap and every 3-day renewal (create-then-delete). If a previous swap was interrupted between the create and the `prev_cron_id` cleanup, a stale ongo cron can still be live with an ID no longer in `cron_id` (check `prev_cron_id` too). List all cron jobs and CronDelete any whose prompt is the ongo tick prompt (it begins with `Run one ongo research agent tick.`), not only the one recorded in state. Shutting down while leaving an orphan cron alive means the loop never actually stops.
+4. **Defensively sweep for orphans.** `cron_id` is rewritten on every fast-mode swap and every 3.5-day renewal (create-then-delete). If a previous swap was interrupted between the create and the `prev_cron_id` cleanup, a stale ongo cron can still be live with an ID no longer in `cron_id` (check `prev_cron_id` too). List all cron jobs and CronDelete any whose prompt is the ongo tick prompt (it begins with `Run one ongo research agent tick.`), not only the one recorded in state. Shutting down while leaving an orphan cron alive means the loop never actually stops.
 5. Stop processing.
 
 ## Processing Messages
