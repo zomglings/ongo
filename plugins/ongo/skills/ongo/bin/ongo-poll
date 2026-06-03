@@ -76,53 +76,19 @@ LIM = "200"
 # next fast-mode tick. 4 attempts total (initial + 3 retries).
 BACKOFFS = (5, 15, 30)
 
-# Tri-state cache of whether the installed clacks understands
-# `--order asc` (added in slack-clacks 0.10.3, PR #84). None == not yet
-# probed; True/False == result of the first probe. Cached per-process so
-# we don't burn a wasted subprocess every tick on old installs.
-#
-# Once a minimum-clacks version is pinned in ongo's install instructions,
-# this whole probe + the no-`--order` fallback path can be deleted and
-# the call collapses to a single fixed argv. Until then, the conditional
-# shape keeps the poll loop forward- and backward-compatible across
-# clacks versions.
-ORDER_FLAG_SUPPORTED = None
-
-
-def run_clacks_read(channel, last_user_ts, with_order):
-    argv = ["clacks", "read", "-c", channel, "--since", last_user_ts,
-            "-l", LIM]
-    if with_order:
-        argv += ["--order", "asc"]
-    return subprocess.run(
-        argv, capture_output=True, text=True, timeout=60,
-    )
-
-
 def _read_once(channel, last_user_ts):
-    global ORDER_FLAG_SUPPORTED
-    # Always try `--order asc` first unless we've already learned the
-    # installed clacks doesn't know it.
-    try_order = ORDER_FLAG_SUPPORTED is not False
+    # `--order asc` is the canonical ascending-by-ts shape that ongo's
+    # tick loop expects. Requires slack-clacks >= 0.10.3 (the version
+    # that introduced the flag). The minimum is pinned in SKILL.md
+    # Startup step 1.
     try:
-        p = run_clacks_read(channel, last_user_ts, with_order=try_order)
+        p = subprocess.run(
+            ["clacks", "read", "-c", channel, "--since", last_user_ts,
+             "-l", LIM, "--order", "asc"],
+            capture_output=True, text=True, timeout=60,
+        )
     except Exception as e:
         return None, f"subprocess: {e}"
-    # argparse on an unrecognised flag exits 2 with stderr that includes
-    # "unrecognized arguments: --order". That's the one and only signal
-    # for "old clacks; drop the flag and retry once". Any other non-zero
-    # exit is a real error and flows through the JSON-parsing path below.
-    if (try_order and p.returncode == 2
-            and "unrecognized arguments" in p.stderr
-            and "--order" in p.stderr):
-        ORDER_FLAG_SUPPORTED = False
-        try:
-            p = run_clacks_read(channel, last_user_ts, with_order=False)
-        except Exception as e:
-            return None, f"subprocess: {e}"
-    elif try_order and ORDER_FLAG_SUPPORTED is None:
-        # First successful invocation with the flag — lock in support.
-        ORDER_FLAG_SUPPORTED = True
     out, err = p.stdout.strip(), p.stderr.strip()
     # Parse first. NEVER substring-scan the blob — message bodies (incl.
     # ongo's own status posts) legitimately contain "ratelimited" etc.
@@ -174,10 +140,9 @@ def poll(channel, last_user_ts):
             "[ongo:", "_[ongo:",
         ))
 
-    # Slack ts are canonical "<10-digit secs>.<6-digit micros>" strings;
-    # within the current epoch era (2001..2286) integer width is fixed,
-    # so lexicographic order == numeric order for genuine message ts.
-    allm = sorted((m for m in msgs if m.get("ts")), key=lambda m: m["ts"])
+    # clacks returns ascending by ts (`--order asc`), so we just keep
+    # messages that have a ts and trust the order.
+    allm = [m for m in msgs if m.get("ts")]
     # --since is inclusive; strictly exclude the gate message itself.
     users = [m for m in allm
              if not is_bot(m) and m.get("ts", "0") > last_user_ts]
