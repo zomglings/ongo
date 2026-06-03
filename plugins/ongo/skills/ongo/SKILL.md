@@ -1,6 +1,6 @@
 ---
 name: ongo
-version: 0.3.16
+version: 0.3.17
 description: >-
   Autonomous research agent. Polls Slack for research requests, tracks findings
   in kendb, expands research when idle, and self-improves on a 24-hour cycle.
@@ -21,7 +21,7 @@ args: "[--channel <channel_id>] [--interval <minutes>] [--idle]"
 
 **jq**: `command -v jq` — if missing, tell user to install and halt.
 
-**clacks**: `command -v clacks` — if missing: `uv tool install slack-clacks || pip install slack-clacks`
+**clacks**: `command -v clacks` — if missing: `uv tool install 'slack-clacks>=0.10.3' || pip install 'slack-clacks>=0.10.3'`. The `>=0.10.3` floor is load-bearing: `bin/ongo-poll` calls `clacks read … --order asc`, which is the ascending-by-`ts` shape the tick loop expects; the flag was added in slack-clacks 0.10.3. If clacks is already installed, verify `clacks --version` reports `>= 0.10.3` and upgrade with the same install command if not.
 Verify auth and capture USER_ID:
 ```bash
 AUTH_INFO=$(clacks auth status)

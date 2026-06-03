@@ -76,12 +76,15 @@ LIM = "200"
 # next fast-mode tick. 4 attempts total (initial + 3 retries).
 BACKOFFS = (5, 15, 30)
 
-
 def _read_once(channel, last_user_ts):
+    # `--order asc` is the canonical ascending-by-ts shape that ongo's
+    # tick loop expects. Requires slack-clacks >= 0.10.3 (the version
+    # that introduced the flag). The minimum is pinned in SKILL.md
+    # Startup step 1.
     try:
         p = subprocess.run(
             ["clacks", "read", "-c", channel, "--since", last_user_ts,
-             "-l", LIM],
+             "-l", LIM, "--order", "asc"],
             capture_output=True, text=True, timeout=60,
         )
     except Exception as e:
@@ -137,10 +140,9 @@ def poll(channel, last_user_ts):
             "[ongo:", "_[ongo:",
         ))
 
-    # Slack ts are canonical "<10-digit secs>.<6-digit micros>" strings;
-    # within the current epoch era (2001..2286) integer width is fixed,
-    # so lexicographic order == numeric order for genuine message ts.
-    allm = sorted((m for m in msgs if m.get("ts")), key=lambda m: m["ts"])
+    # clacks returns ascending by ts (`--order asc`), so we just keep
+    # messages that have a ts and trust the order.
+    allm = [m for m in msgs if m.get("ts")]
     # --since is inclusive; strictly exclude the gate message itself.
     users = [m for m in allm
              if not is_bot(m) and m.get("ts", "0") > last_user_ts]
