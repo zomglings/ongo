@@ -127,7 +127,15 @@ def poll(channel, last_user_ts):
         }
 
     def is_bot(m):
-        return m.get("text", "").lstrip().startswith(("[ongo]", "_[ongo]"))
+        # Accept both the loop's [ongo] prefix and the subagent's
+        # [ongo, <id>] / [ongo:<id>] prefix; the italics-wrapped _[ongo…
+        # variants are also bot-spoken. Anything else is a user message.
+        t = m.get("text", "").lstrip()
+        return t.startswith((
+            "[ongo]", "_[ongo]",
+            "[ongo,", "_[ongo,",
+            "[ongo:", "_[ongo:",
+        ))
 
     # Slack ts are canonical "<10-digit secs>.<6-digit micros>" strings;
     # within the current epoch era (2001..2286) integer width is fixed,
