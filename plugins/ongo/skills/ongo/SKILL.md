@@ -1,6 +1,6 @@
 ---
 name: ongo
-version: 0.3.15
+version: 0.3.16
 description: >-
   Autonomous research agent. Polls Slack for research requests, tracks findings
   in kendb, expands research when idle, and self-improves on a 24-hour cycle.
@@ -310,15 +310,26 @@ Rationale: subagents (especially Opus) have substantial memory footprints. Runni
    ${CLAUDE_SKILL_DIR}/bin/ken list --kind topic
    ```
 3. Pick a topic **randomly**, weighted by `ongo-exploration` directives. Skip if no topics.
-4. **Launch a subagent** (via the Agent tool with the appropriate model for the current memory tier and `run_in_background: true`) whose prompt contains only:
+4. **Launch a subagent** (via the Agent tool with the appropriate model for the current memory tier and `run_in_background: true`) whose prompt contains:
    - The topic title and ID
    - The ken binary path: `${CLAUDE_SKILL_DIR}/bin/ken`
    - The clacks channel ID
    - The **self-contextualization instructions** below
+   - The **subagent identifier** — the short id returned by the Agent tool — so the subagent can prefix its own Slack posts with `[ongo, <id>]`. Pass the id explicitly in the prompt; do not rely on the subagent inferring it from context.
 
-**Subagent self-contextualization instructions** (include verbatim in the prompt):
+   **Immediately after the Agent tool returns**, the loop posts a spawn announcement to Slack:
 
-> You are an ongo research expansion agent. Before doing any research, build your context from kendb:
+   ```bash
+   clacks send -c "$CHANNEL" -m "[ongo] Spawning subagent <id> for: <one-line task summary>"
+   ```
+
+   The announcement must use the loop's `[ongo]` prefix (not `[ongo, <id>]`) because the loop, not the subagent, is the speaker. The id must be the exact value passed to the subagent so that the subagent's later posts can be matched to this announcement. The announcement is sent **before** the loop continues with any other work — even if the loop will go on to spawn a second subagent in the same tick, each spawn is announced individually before the next is launched.
+
+**Subagent self-contextualization instructions** (include verbatim in the prompt, with `SUBAGENT_ID` replaced by the actual id returned by the Agent tool):
+
+> You are an ongo research expansion agent. Your subagent id is `SUBAGENT_ID`. Every Slack message you post in this run **must** start with the literal prefix `[ongo, SUBAGENT_ID]` (no leading space, no markdown wrapper before the prefix). This prefix is what the ongo poll filter uses to recognise your messages as bot traffic; messages without it will be re-processed as user messages and may trigger an infinite loop. The italics-wrapped variant `_[ongo, SUBAGENT_ID] … _` is also accepted by the filter.
+>
+> Before doing any research, build your context from kendb:
 >
 > 1. Run `KEN list --kind topic` to see all topics and their IDs.
 > 2. Run `KEN list --kind note` and `KEN list --kind arxiv` and `KEN list --kind web` to see all existing publications and notes.
@@ -334,9 +345,12 @@ Rationale: subagents (especially Opus) have substantial memory footprints. Runni
 > - Create cross-topic relationships where you find connections to other topics.
 > - Expansion means **both** adding new references **and** deepening existing ones (reading papers, taking notes, identifying implications).
 >
-> When done, report via: `clacks send -c "CHANNEL" -m "_[ongo] Expanded research on: <topic title> — <summary>_"`
+> **Sign-off (mandatory).** Before you return, post exactly one final Slack message — your sign-off — via:
+> `clacks send -c "CHANNEL" -m "[ongo, SUBAGENT_ID] Done — <one-line summary of what you produced> <URL or artifact pointer if any>"`
 >
-> (Replace KEN and CHANNEL with the actual paths/IDs provided.)
+> The sign-off is what tells the loop and the user that your run finished normally. A subagent that returns without a sign-off is treated as having crashed silently. Do not send the sign-off in the body of an intermediate post — it must be its own message, with its own `[ongo, SUBAGENT_ID]` prefix, sent immediately before you return.
+>
+> (Replace KEN and CHANNEL with the actual paths/IDs provided. `SUBAGENT_ID` is provided to you in this prompt and must be used verbatim.)
 
 5. Continue the main loop immediately — do NOT wait for the expansion agent to finish.
 
@@ -393,8 +407,23 @@ File issues/PRs against tools (ken, clacks, etc.) when you hit bugs or missing f
 
 ## Message Format
 
-- **Always** prepend `[ongo]` to every sent message — this is how the poll filter works. Omitting it causes an infinite loop.
-- Truncate responses over 30000 chars. Use `_..._` for status messages.
+Every message ongo or any ongo-spawned subagent posts to Slack **must** carry a bracketed identity prefix; the poll filter uses that prefix to distinguish bot traffic from user traffic, and a missing or malformed prefix is what causes the loop to re-process its own messages and run away. Two prefixes are valid:
+
+- **`[ongo]`** — used by the main tick loop for status messages, user replies, and shutdown notices.
+- **`[ongo, <subagent-id>]`** — used by every subagent spawned by the loop. `<subagent-id>` is the short identifier returned by the Agent tool (or the abbreviation the loop adopts when announcing the spawn, see Auto-Expansion step 4). This makes it possible to attribute a Slack message to the specific subagent that produced it, including when several subagents post concurrently.
+
+The poll filter in `bin/ongo-poll` recognises both forms (it accepts `[ongo]`, `[ongo,`, `[ongo:`, and the italics-wrapped `_[ongo]…` / `_[ongo,…` / `_[ongo:…` variants). Anything that does **not** start with one of those patterns is treated as a user message and routed back into the tick loop — including a stray `[Ongo]` (wrong case), `[ ongo]` (leading space inside the bracket), or `(ongo)` (wrong bracket). Spawn-time announcements from the loop, status updates from subagents, and the subagent's sign-off message all share the same prefix rule.
+
+**Subagent lifecycle messages.** The loop and the subagent jointly post three messages per spawn so the user always sees a complete arc:
+
+1. **Spawn announcement** — the loop, immediately after the Agent tool returns the subagent id, posts `[ongo] Spawning subagent <id> for: <task summary>`. The user sees the id at the moment of creation; if the run later misbehaves the id is already pinned in the channel.
+2. **Mid-run posts** (optional, but recommended for long-running work) — the subagent posts `[ongo, <id>] <progress>` whenever it would otherwise be useful to surface a milestone.
+3. **Sign-off** — the subagent posts a single `[ongo, <id>] Done — <one-line summary> [<URL or artifact pointer if any>]` immediately before it returns. The sign-off is mandatory; a subagent that exits without one is treated as having crashed silently, and the loop will note this on the next tick if the absence is detected. The loop never posts the sign-off on the subagent's behalf — it must come from the subagent itself so it carries the subagent's id.
+
+Other constraints:
+
+- Truncate responses over 30000 chars. Use `_..._` for italic status messages (the underscore wrapper around the whole message is allowed and the poll filter still matches via the `_[ongo`… prefixes).
+- The prefix is matched as a literal string at the very start of the message text. A message that starts with leading whitespace, a markdown bullet, or a code fence is no longer prefixed and will be eaten by the poll filter — write the prefix as the first characters of the message body.
 
 ## kendb Management Tools
 
