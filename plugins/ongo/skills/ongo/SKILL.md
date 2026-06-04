@@ -288,7 +288,7 @@ Interpret as natural language. The user might ask to:
 
 Prefer delegating heavyweight research requests to subagents using the most capable available model (opus at time of writing — check for newer models during self-improvement) with the self-contextualization pattern below. Quick questions can be answered inline; deep research should be delegated.
 
-!`${CLAUDE_SKILL_DIR}/bin/print-style-section.sh`
+!`${CLAUDE_SKILL_DIR}/bin/print-style.sh section`
 
 ## Auto-Expansion
 
@@ -318,7 +318,7 @@ Rationale: subagents (especially Opus) have substantial memory footprints. Runni
    - The clacks channel ID
    - The **self-contextualization instructions** below
    - The **subagent identifier** — the short id returned by the Agent tool — so the subagent can prefix its own Slack posts with `[ongo, <id>]`. Pass the id explicitly in the prompt; do not rely on the subagent inferring it from context.
-   - The **writing-style block** (see "Writing style" above). At dispatch time, the loop re-reads the file with the same loader (`head -c 4096 ${CLAUDE_SKILL_DIR}/writing-style.md 2>/dev/null`) and, if the output is non-empty, embeds it verbatim under a `## Writing style` heading near the top of the subagent prompt. If empty/absent, omit the heading. The subagent reads it as a controlling style guide for everything it writes.
+!`${CLAUDE_SKILL_DIR}/bin/print-style.sh dispatch-bullet`
 
    **Immediately after the Agent tool returns**, the loop posts a spawn announcement to Slack:
 
@@ -332,7 +332,7 @@ Rationale: subagents (especially Opus) have substantial memory footprints. Runni
 
 > You are an ongo research expansion agent. Your subagent id is `SUBAGENT_ID`. Every Slack message you post in this run **must** start with the literal prefix `[ongo, SUBAGENT_ID]` (no leading space, no markdown wrapper before the prefix). This prefix is what the ongo poll filter uses to recognise your messages as bot traffic; messages without it will be re-processed as user messages and may trigger an infinite loop. The italics-wrapped variant `_[ongo, SUBAGENT_ID] … _` is also accepted by the filter.
 >
-> **Writing style.** If the prompt above includes a `## Writing style` section, treat its contents as the controlling style guide for every piece of prose you produce in this run — the note body, intermediate Slack updates, and the final sign-off. The guide is more important than your default voice; defer to it on every conflict. **If you spawn any sub-subagents of your own, copy the same `## Writing style` block verbatim into their prompts** so the guide propagates transitively down the spawn tree. If no `## Writing style` section is present in your own prompt, use your native style and do not add a style header to any subagents you spawn.
+!`${CLAUDE_SKILL_DIR}/bin/print-style.sh subagent-paragraph`
 >
 > Before doing any research, build your context from kendb:
 >
