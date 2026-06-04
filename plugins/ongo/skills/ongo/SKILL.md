@@ -288,21 +288,7 @@ Interpret as natural language. The user might ask to:
 
 Prefer delegating heavyweight research requests to subagents using the most capable available model (opus at time of writing — check for newer models during self-improvement) with the self-contextualization pattern below. Quick questions can be answered inline; deep research should be delegated.
 
-## Writing style
-
-ongo respects an *optional* writing-style guide loaded from `${CLAUDE_SKILL_DIR}/writing-style.md`. The loader uses Claude Code's inline command-substitution syntax (the `` !`command` `` form, documented at https://code.claude.com/docs/en/skills.md) — at every skill invocation (each cron-fired tick is a fresh skill load), the harness executes the substitution below before the model sees this section, and replaces it in place with the file's contents (or with empty output if the file is absent). The substituted block sits in the model's system context for the entire tick.
-
-The loader, executed verbatim at skill-load time:
-
-<!-- writing-style-guide:start -->
-!`if [ -f "${CLAUDE_SKILL_DIR}/writing-style.md" ]; then head -c 4096 "${CLAUDE_SKILL_DIR}/writing-style.md"; fi`
-<!-- writing-style-guide:end -->
-
-If the substituted block above is non-empty, treat its contents as a *controlling style guide* for every piece of prose produced in this tick — Slack replies, status messages, spawn announcements, sign-off relays. Every prose-generating subagent dispatched this tick must also receive the same block verbatim under a `## Writing style` heading in its prompt (see Auto-Expansion step 4 — re-cat the file at dispatch time and embed). **The style is inherited transitively**: a subagent that itself dispatches further subagents must copy the block into their prompts too, so the guide propagates the entire spawn tree. If the block is empty (no file or empty file), use the model's native style and add no style header to subagent prompts at any depth.
-
-The 4096-char ceiling is enforced by `head -c 4096` in the loader so an oversized file cannot bloat every skill load. The file itself is not shipped with the skill — it is an opt-in per-deployment customisation. A fork that wants a particular voice (e.g. concise, code-and-math-first, no recycled rhetorical tics) commits its own `writing-style.md` to its plugin payload; vanilla `zomglings/ongo` installs ship without one and behave as before.
-
-**Subagents-only for note writes.** A consequence of having a single style-enforcement point: the loop must not write new ongo notes or substantial note edits directly. Every new publication (kind `note`, `arxiv`, `web`, etc.) and every edit longer than one paragraph goes through a subagent — the subagent is the only writer that sees the style block embedded in its prompt, so writing notes inline from the loop bypasses the very mechanism this section sets up. Trivial inline ops the loop continues to do itself: renames, dedup deletions, regeneration, kendb housekeeping, slug fixes, Slack replies of any length. The rule is about *prose published to the site*, not about any character of prose the loop ever emits.
+!`${CLAUDE_SKILL_DIR}/bin/print-style-section.sh`
 
 ## Auto-Expansion
 
