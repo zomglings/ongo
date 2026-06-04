@@ -1,6 +1,6 @@
 ---
 name: ongo
-version: 0.3.17
+version: 0.3.18
 description: >-
   Autonomous research agent. Polls Slack for research requests, tracks findings
   in kendb, expands research when idle, and self-improves on a 24-hour cycle.
@@ -288,6 +288,8 @@ Interpret as natural language. The user might ask to:
 
 Prefer delegating heavyweight research requests to subagents using the most capable available model (opus at time of writing — check for newer models during self-improvement) with the self-contextualization pattern below. Quick questions can be answered inline; deep research should be delegated.
 
+!`${CLAUDE_SKILL_DIR}/bin/print-style.sh section`
+
 ## Auto-Expansion
 
 **Delegate to an intelligent subagent** using the most capable available model. The main loop stays lean — it only picks a topic, checks memory, and launches the agent. The subagent self-loads its own context from kendb.
@@ -316,6 +318,7 @@ Rationale: subagents (especially Opus) have substantial memory footprints. Runni
    - The clacks channel ID
    - The **self-contextualization instructions** below
    - The **subagent identifier** — the short id returned by the Agent tool — so the subagent can prefix its own Slack posts with `[ongo, <id>]`. Pass the id explicitly in the prompt; do not rely on the subagent inferring it from context.
+!`${CLAUDE_SKILL_DIR}/bin/print-style.sh dispatch-bullet`
 
    **Immediately after the Agent tool returns**, the loop posts a spawn announcement to Slack:
 
@@ -328,6 +331,8 @@ Rationale: subagents (especially Opus) have substantial memory footprints. Runni
 **Subagent self-contextualization instructions** (include verbatim in the prompt, with `SUBAGENT_ID` replaced by the actual id returned by the Agent tool):
 
 > You are an ongo research expansion agent. Your subagent id is `SUBAGENT_ID`. Every Slack message you post in this run **must** start with the literal prefix `[ongo, SUBAGENT_ID]` (no leading space, no markdown wrapper before the prefix). This prefix is what the ongo poll filter uses to recognise your messages as bot traffic; messages without it will be re-processed as user messages and may trigger an infinite loop. The italics-wrapped variant `_[ongo, SUBAGENT_ID] … _` is also accepted by the filter.
+>
+!`${CLAUDE_SKILL_DIR}/bin/print-style.sh subagent-paragraph`
 >
 > Before doing any research, build your context from kendb:
 >
