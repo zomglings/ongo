@@ -1,6 +1,6 @@
 ---
 name: ongo
-version: 0.3.17
+version: 0.3.18
 description: >-
   Autonomous research agent. Polls Slack for research requests, tracks findings
   in kendb, expands research when idle, and self-improves on a 24-hour cycle.
@@ -288,6 +288,28 @@ Interpret as natural language. The user might ask to:
 
 Prefer delegating heavyweight research requests to subagents using the most capable available model (opus at time of writing — check for newer models during self-improvement) with the self-contextualization pattern below. Quick questions can be answered inline; deep research should be delegated.
 
+## Writing style
+
+ongo respects an *optional* writing-style guide loaded from disk. At every skill invocation (i.e. every cron-fired tick — each tick is a fresh skill load), the loop must:
+
+```python
+import os
+style_path = os.path.join(os.environ["CLAUDE_SKILL_DIR"], "writing-style.md")
+if os.path.exists(style_path):
+    style = open(style_path, "r", encoding="utf-8").read().strip()
+    if len(style) > 4096:
+        style = style[:4096]
+        # log a warning to Slack: "_[ongo] writing-style.md > 4096 chars, truncated._"
+else:
+    style = ""
+```
+
+If `style` is non-empty, the loop treats it as a *controlling style guide* for every piece of prose it produces this tick — Slack replies, status messages, spawn announcements, sign-off relays. Every prose-generating subagent dispatched this tick receives the style verbatim under a `## Writing style` heading in its prompt (see Auto-Expansion step 4). If `style` is empty or the file is absent, the loop uses the model's native style and no style header is added to subagent prompts.
+
+The file itself is not shipped with the skill — it is an opt-in per-deployment customisation. A fork that wants a particular voice (e.g. concise, code-and-math-first, no recycled rhetorical tics) commits its own `writing-style.md` to its plugin payload; vanilla `zomglings/ongo` installs ship without one and behave as before.
+
+**Subagents-only for note writes.** A consequence of having a single style-enforcement point: the loop must not write new ongo notes or substantial note edits directly. Every new publication (kind `note`, `arxiv`, `web`, etc.) and every edit longer than one paragraph goes through a subagent — the subagent is the only writer that sees the style block embedded in its prompt, so writing notes inline from the loop bypasses the very mechanism this section sets up. Trivial inline ops the loop continues to do itself: renames, dedup deletions, regeneration, kendb housekeeping, slug fixes, Slack replies of any length. The rule is about *prose published to the site*, not about any character of prose the loop ever emits.
+
 ## Auto-Expansion
 
 **Delegate to an intelligent subagent** using the most capable available model. The main loop stays lean — it only picks a topic, checks memory, and launches the agent. The subagent self-loads its own context from kendb.
@@ -316,6 +338,7 @@ Rationale: subagents (especially Opus) have substantial memory footprints. Runni
    - The clacks channel ID
    - The **self-contextualization instructions** below
    - The **subagent identifier** — the short id returned by the Agent tool — so the subagent can prefix its own Slack posts with `[ongo, <id>]`. Pass the id explicitly in the prompt; do not rely on the subagent inferring it from context.
+   - The **writing-style block** (see "Writing style" above) — if `style` is non-empty this tick, embed it verbatim under a `## Writing style` heading near the top of the prompt. If `style` is empty/absent, omit the heading entirely. The subagent reads it as a controlling style guide for everything it writes.
 
    **Immediately after the Agent tool returns**, the loop posts a spawn announcement to Slack:
 
@@ -328,6 +351,8 @@ Rationale: subagents (especially Opus) have substantial memory footprints. Runni
 **Subagent self-contextualization instructions** (include verbatim in the prompt, with `SUBAGENT_ID` replaced by the actual id returned by the Agent tool):
 
 > You are an ongo research expansion agent. Your subagent id is `SUBAGENT_ID`. Every Slack message you post in this run **must** start with the literal prefix `[ongo, SUBAGENT_ID]` (no leading space, no markdown wrapper before the prefix). This prefix is what the ongo poll filter uses to recognise your messages as bot traffic; messages without it will be re-processed as user messages and may trigger an infinite loop. The italics-wrapped variant `_[ongo, SUBAGENT_ID] … _` is also accepted by the filter.
+>
+> **Writing style.** If the prompt above includes a `## Writing style` section, treat its contents as the controlling style guide for every piece of prose you produce in this run — the note body, intermediate Slack updates, and the final sign-off. The guide is more important than your default voice; defer to it on every conflict. If no `## Writing style` section is present, use your native style.
 >
 > Before doing any research, build your context from kendb:
 >
