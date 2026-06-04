@@ -290,23 +290,17 @@ Prefer delegating heavyweight research requests to subagents using the most capa
 
 ## Writing style
 
-ongo respects an *optional* writing-style guide loaded from disk. At every skill invocation (i.e. every cron-fired tick — each tick is a fresh skill load), the loop must:
+ongo respects an *optional* writing-style guide loaded from `${CLAUDE_SKILL_DIR}/writing-style.md`. The loader uses Claude Code's inline command-substitution syntax (the `` !`command` `` form, documented at https://code.claude.com/docs/en/skills.md) — at every skill invocation (each cron-fired tick is a fresh skill load), the harness executes the substitution below before the model sees this section, and replaces it in place with the file's contents (or with empty output if the file is absent). The substituted block sits in the model's system context for the entire tick.
 
-```python
-import os
-style_path = os.path.join(os.environ["CLAUDE_SKILL_DIR"], "writing-style.md")
-if os.path.exists(style_path):
-    style = open(style_path, "r", encoding="utf-8").read().strip()
-    if len(style) > 4096:
-        style = style[:4096]
-        # log a warning to Slack: "_[ongo] writing-style.md > 4096 chars, truncated._"
-else:
-    style = ""
-```
+The loader, executed verbatim at skill-load time:
 
-If `style` is non-empty, the loop treats it as a *controlling style guide* for every piece of prose it produces this tick — Slack replies, status messages, spawn announcements, sign-off relays. Every prose-generating subagent dispatched this tick receives the style verbatim under a `## Writing style` heading in its prompt (see Auto-Expansion step 4). If `style` is empty or the file is absent, the loop uses the model's native style and no style header is added to subagent prompts.
+<!-- writing-style-guide:start -->
+!`if [ -f "${CLAUDE_SKILL_DIR}/writing-style.md" ]; then head -c 4096 "${CLAUDE_SKILL_DIR}/writing-style.md"; fi`
+<!-- writing-style-guide:end -->
 
-The file itself is not shipped with the skill — it is an opt-in per-deployment customisation. A fork that wants a particular voice (e.g. concise, code-and-math-first, no recycled rhetorical tics) commits its own `writing-style.md` to its plugin payload; vanilla `zomglings/ongo` installs ship without one and behave as before.
+If the substituted block above is non-empty, treat its contents as a *controlling style guide* for every piece of prose produced in this tick — Slack replies, status messages, spawn announcements, sign-off relays. Every prose-generating subagent dispatched this tick must also receive the same block verbatim under a `## Writing style` heading in its prompt (see Auto-Expansion step 4 — re-cat the file at dispatch time and embed). If the block is empty (no file or empty file), use the model's native style and add no style header to subagent prompts.
+
+The 4096-char ceiling is enforced by `head -c 4096` in the loader so an oversized file cannot bloat every skill load. The file itself is not shipped with the skill — it is an opt-in per-deployment customisation. A fork that wants a particular voice (e.g. concise, code-and-math-first, no recycled rhetorical tics) commits its own `writing-style.md` to its plugin payload; vanilla `zomglings/ongo` installs ship without one and behave as before.
 
 **Subagents-only for note writes.** A consequence of having a single style-enforcement point: the loop must not write new ongo notes or substantial note edits directly. Every new publication (kind `note`, `arxiv`, `web`, etc.) and every edit longer than one paragraph goes through a subagent — the subagent is the only writer that sees the style block embedded in its prompt, so writing notes inline from the loop bypasses the very mechanism this section sets up. Trivial inline ops the loop continues to do itself: renames, dedup deletions, regeneration, kendb housekeeping, slug fixes, Slack replies of any length. The rule is about *prose published to the site*, not about any character of prose the loop ever emits.
 
@@ -338,7 +332,7 @@ Rationale: subagents (especially Opus) have substantial memory footprints. Runni
    - The clacks channel ID
    - The **self-contextualization instructions** below
    - The **subagent identifier** — the short id returned by the Agent tool — so the subagent can prefix its own Slack posts with `[ongo, <id>]`. Pass the id explicitly in the prompt; do not rely on the subagent inferring it from context.
-   - The **writing-style block** (see "Writing style" above) — if `style` is non-empty this tick, embed it verbatim under a `## Writing style` heading near the top of the prompt. If `style` is empty/absent, omit the heading entirely. The subagent reads it as a controlling style guide for everything it writes.
+   - The **writing-style block** (see "Writing style" above). At dispatch time, the loop re-reads the file with the same loader (`head -c 4096 ${CLAUDE_SKILL_DIR}/writing-style.md 2>/dev/null`) and, if the output is non-empty, embeds it verbatim under a `## Writing style` heading near the top of the subagent prompt. If empty/absent, omit the heading. The subagent reads it as a controlling style guide for everything it writes.
 
    **Immediately after the Agent tool returns**, the loop posts a spawn announcement to Slack:
 
