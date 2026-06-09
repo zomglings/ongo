@@ -288,7 +288,7 @@ Interpret as natural language. The user might ask to:
 
 Prefer delegating heavyweight research requests to subagents using the most capable available model (opus at time of writing — check for newer models during self-improvement) with the self-contextualization pattern below. Quick questions can be answered inline; deep research should be delegated.
 
-!`${CLAUDE_SKILL_DIR}/bin/print-style.sh section`
+!`d="${CLAUDE_SKILL_DIR:-$(([ -d "$HOME/.claude/skills/ongo" ] && echo "$HOME/.claude/skills/ongo") || (ls -d "$HOME"/.claude/plugins/cache/ongo/ongo/*/skills/ongo 2>/dev/null | sort -V | tail -1))}"; "$d/bin/print-style.sh" section`
 
 ## Auto-Expansion
 
@@ -318,7 +318,7 @@ Rationale: subagents (especially Opus) have substantial memory footprints. Runni
    - The clacks channel ID
    - The **self-contextualization instructions** below
    - The **subagent identifier** — the short id returned by the Agent tool — so the subagent can prefix its own Slack posts with `[ongo, <id>]`. Pass the id explicitly in the prompt; do not rely on the subagent inferring it from context.
-!`${CLAUDE_SKILL_DIR}/bin/print-style.sh dispatch-bullet`
+!`d="${CLAUDE_SKILL_DIR:-$(([ -d "$HOME/.claude/skills/ongo" ] && echo "$HOME/.claude/skills/ongo") || (ls -d "$HOME"/.claude/plugins/cache/ongo/ongo/*/skills/ongo 2>/dev/null | sort -V | tail -1))}"; "$d/bin/print-style.sh" dispatch-bullet`
 
    **Immediately after the Agent tool returns**, the loop posts a spawn announcement to Slack:
 
@@ -332,7 +332,7 @@ Rationale: subagents (especially Opus) have substantial memory footprints. Runni
 
 > You are an ongo research expansion agent. Your subagent id is `SUBAGENT_ID`. Every Slack message you post in this run **must** start with the literal prefix `[ongo, SUBAGENT_ID]` (no leading space, no markdown wrapper before the prefix). This prefix is what the ongo poll filter uses to recognise your messages as bot traffic; messages without it will be re-processed as user messages and may trigger an infinite loop. The italics-wrapped variant `_[ongo, SUBAGENT_ID] … _` is also accepted by the filter.
 >
-!`${CLAUDE_SKILL_DIR}/bin/print-style.sh subagent-paragraph`
+!`d="${CLAUDE_SKILL_DIR:-$(([ -d "$HOME/.claude/skills/ongo" ] && echo "$HOME/.claude/skills/ongo") || (ls -d "$HOME"/.claude/plugins/cache/ongo/ongo/*/skills/ongo 2>/dev/null | sort -V | tail -1))}"; "$d/bin/print-style.sh" subagent-paragraph`
 >
 > Before doing any research, build your context from kendb:
 >
