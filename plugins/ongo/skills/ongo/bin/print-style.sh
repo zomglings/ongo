@@ -29,7 +29,13 @@
 set -eu
 
 MODE="${1:-section}"
-STYLE_FILE="${CLAUDE_SKILL_DIR}/writing-style.md"
+
+# Resolve the skill root. Prefer the harness-supplied override; otherwise
+# fall back to this script's own parent directory (print-style.sh lives at
+# <skill-root>/bin/print-style.sh). Lets the skill load even when the
+# Claude Code harness fails to export CLAUDE_SKILL_DIR.
+SKILL_DIR="${CLAUDE_SKILL_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+STYLE_FILE="$SKILL_DIR/writing-style.md"
 
 if [ ! -s "$STYLE_FILE" ]; then
   exit 0
