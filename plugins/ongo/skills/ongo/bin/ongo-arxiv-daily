@@ -46,6 +46,12 @@ PUBKIND_DESCRIPTION = (
     "free-form context."
 )
 
+ONGO_DIGEST_DESCRIPTION = (
+    "A summary of one ongo daily-arxiv-sweep run. The key is an ISO date. "
+    "The title lists the paper counts by topic. Notes contain the paper "
+    "list with links."
+)
+
 
 # ---------- ken discovery ---------------------------------------------------
 
@@ -286,6 +292,109 @@ def build_digest(results: dict[str, list[dict]],
     return "\n".join(lines)
 
 
+def publish_ongo_digest(
+    ken_bin: str,
+    results: dict,
+    errors: dict,
+    iso_date: str,
+    iso_time_hhmm: str,
+) -> tuple[str, str, str]:
+    """Publish one ``ongo-digest`` per sweep run summarising the results.
+
+    Idempotently ensures the ``ongo-digest`` pubkind, then adds a digest
+    publication keyed by ISO date (``YYYY-MM-DD``). If a digest already
+    exists for that date (rare — dev/testing case), an ``HH:MM`` suffix
+    is appended to disambiguate. The paper list body is stashed on a
+    related-to ``note`` publication (mirrors the arxiv abstract pattern),
+    which auto-loads the file body into ken's ``notes`` table so
+    ``ongo-site`` can render it. Returns (digest_id, digest_key, title).
+    """
+    ken_ensure_pubkind(ken_bin, "ongo-digest", ONGO_DIGEST_DESCRIPTION)
+
+    total = sum(len(v) for v in results.values())
+    hit_topics = [(k, v) for k, v in results.items() if v]
+    per_topic = ", ".join(f"{k} ({len(v)})" for k, v in hit_topics)
+    if len(per_topic) > 140:
+        per_topic = per_topic[:137] + "..."
+    title = (
+        f"arxiv digest: {total} new preprint"
+        f"{'s' if total != 1 else ''} across {len(hit_topics)} topic"
+        f"{'s' if len(hit_topics) != 1 else ''} — {per_topic}"
+    )
+
+    # Key = ISO date; suffix HH:MM only if the date is already taken.
+    r = subprocess.run(
+        [ken_bin, "list", "--kind", "ongo-digest"],
+        capture_output=True, text=True,
+    )
+    existing_keys: set[str] = set()
+    if r.returncode == 0 and r.stdout.strip():
+        try:
+            for it in json.loads(r.stdout):
+                k = it.get("key")
+                if k:
+                    existing_keys.add(k)
+        except json.JSONDecodeError:
+            pass
+    key = iso_date
+    if key in existing_keys:
+        key = f"{iso_date}-{iso_time_hhmm}"
+
+    # Body — grouped by topic, one line per paper, abstract-linked.
+    lines = [
+        f"# Daily arxiv digest — {iso_date}",
+        "",
+        f"**{total} new preprint"
+        f"{'s' if total != 1 else ''} across {len(hit_topics)} topic"
+        f"{'s' if len(hit_topics) != 1 else ''}.**",
+        "",
+    ]
+    for topic_key, papers in hit_topics:
+        lines.append(f"## {topic_key} ({len(papers)})")
+        lines.append("")
+        for p in papers:
+            cat = p.get("category") or ""
+            pub = (p.get("published") or "")[:10]
+            meta = ", ".join(x for x in (cat, pub) if x)
+            suffix = f" — {meta}" if meta else ""
+            lines.append(
+                f"- [{p['title']}](http://arxiv.org/abs/{p['id']}){suffix}"
+            )
+        lines.append("")
+    if errors:
+        lines.append("## errors")
+        lines.append("")
+        for topic_key, msg in sorted(errors.items()):
+            lines.append(f"- {topic_key}: {msg}")
+        lines.append("")
+    body = "\n".join(lines)
+
+    # Write body to a tempfile — the note-kind publication auto-loads it.
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", delete=False,
+        prefix=f"ongo-digest-{key}-",
+    ) as f:
+        f.write(body)
+        note_path = f.name
+
+    # 1. Add the digest publication (title-only; the ISO-date key drives
+    #    the digests-tab index; body lives on the related note below).
+    r = ken(ken_bin, "add", "ongo-digest", "-k", key, "--title", title)
+    digest_id = r.stdout.strip().splitlines()[-1]
+
+    # 2. Add the body as a `note` publication (auto-loaded from disk),
+    #    relate digest --related-to--> note. ongo-site follows this edge.
+    r = ken(
+        ken_bin, "add", "note", "-k", note_path,
+        "--title", f"arxiv digest body — {key}",
+    )
+    note_id = r.stdout.strip().splitlines()[-1]
+    ken(ken_bin, "relate", "-s", digest_id, "-o", note_id,
+        "-r", "related-to")
+
+    return digest_id, key, title
+
+
 def post_digest(channel: str, message: str) -> bool:
     r = subprocess.run(
         ["clacks", "send", "-c", channel, "-m", message],
@@ -390,6 +499,7 @@ def main(argv: list[str] | None = None) -> int:
                     "title": entry["title"],
                     "url": f"http://arxiv.org/abs/{entry['id']}",
                     "category": entry["primary_category"],
+                    "published": entry["published"],
                 })
                 known.add(entry["id"])
                 continue
@@ -407,9 +517,27 @@ def main(argv: list[str] | None = None) -> int:
                 "title": entry["title"],
                 "url": f"http://arxiv.org/abs/{entry['id']}",
                 "category": entry["primary_category"],
+                "published": entry["published"],
             })
 
     total_new = sum(len(v) for v in results.values())
+
+    # Emit one ongo-digest publication per run (before Slack). Only when
+    # there is at least one new paper; empty runs don't create a digest.
+    digest_key: str | None = None
+    if not args.dry_run and total_new > 0:
+        now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+        try:
+            _dig_id, digest_key, _dig_title = publish_ongo_digest(
+                ken_bin,
+                results,
+                errors,
+                now_dt.strftime("%Y-%m-%d"),
+                now_dt.strftime("%H:%M"),
+            )
+        except (subprocess.CalledProcessError, OSError) as e:
+            sys.stderr.write(f"ongo-digest publish failed: {e}\n")
+
     posted = False
     if (not args.dry_run and not args.no_slack and args.channel
             and total_new > 0):
@@ -419,6 +547,7 @@ def main(argv: list[str] | None = None) -> int:
         "topics": len(topics),
         "new": total_new,
         "posted": posted,
+        "digest_key": digest_key,
         "errors": errors,
     }
     print(json.dumps(summary))
