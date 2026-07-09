@@ -1,6 +1,6 @@
 ---
 name: ongo
-version: 0.3.19
+version: 0.3.21
 description: >-
   Autonomous research agent. Polls Slack for research requests, tracks findings
   in kendb, expands research when idle, and self-improves on a 24-hour cycle.
@@ -58,10 +58,18 @@ ${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-cron-reset 2>/dev/null || ${CLAUDE
 ${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-web 2>/dev/null || ${CLAUDE_SKILL_DIR}/bin/ken pubkind add ongo-web "Publish marker for the static site. The key is the target publication's id (or its key), the title is the display/nav label, and an optional notes body overrides the section/topic heading. Only items referenced by an ongo-web entry appear on the generated site (see bin/ongo-site)."
 ```
 
+```bash
+${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-arxiv-topic 2>/dev/null || ${CLAUDE_SKILL_DIR}/bin/ken pubkind add ongo-arxiv-topic "A topic ongo watches for new arxiv preprints. The key is a short slug; the title is an arxiv-API search_query expression; notes are free-form context."
+```
+
+```bash
+${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-digest 2>/dev/null || ${CLAUDE_SKILL_DIR}/bin/ken pubkind add ongo-digest "A summary of one ongo daily-arxiv-sweep run. The key is an ISO date. The title lists the paper counts by topic. Notes contain the paper list with links."
+```
+
 **Registration is not durable — every `ken add <customkind>` must be idempotent.** Startup registration above happens once, but each tick and each subagent runs in a fresh context and may operate against a kendb instance where the custom kind is not registered (this was observed in production: `ken add ongo-cron-reset` failed mid-run because the pubkind was missing from that kendb instance and had to be re-registered by hand). Therefore **never call `ken add <customkind> …` bare.** Always ensure the pubkind first, in the same step:
 
 ```bash
-# Reusable pattern — use this everywhere a custom kind is written (ongo-exploration, ongo-self-improvement, ongo-cron-reset, ongo-web):
+# Reusable pattern — use this everywhere a custom kind is written (ongo-exploration, ongo-self-improvement, ongo-cron-reset, ongo-web, ongo-arxiv-topic, ongo-digest):
 ${CLAUDE_SKILL_DIR}/bin/ken pubkind show <kind> 2>/dev/null || ${CLAUDE_SKILL_DIR}/bin/ken pubkind add <kind> "<description from startup>"
 ${CLAUDE_SKILL_DIR}/bin/ken add <kind> -k "<key>" --title "<title>"
 ```
@@ -86,6 +94,7 @@ Write initial state to `/tmp/ongo_state.json`:
   "channel": "<CHANNEL>",
   "last_user_ts": "<ts of startup message>",
   "last_self_improve": <current unix epoch>,
+  "last_arxiv_daily": 0,
   "rotation": "reference",
   "idle": false,
   "ken": "${CLAUDE_SKILL_DIR}/bin/ken",
@@ -358,6 +367,46 @@ Rationale: subagents (especially Opus) have substantial memory footprints. Runni
 > (Replace KEN and CHANNEL with the actual paths/IDs provided. `SUBAGENT_ID` is provided to you in this prompt and must be used verbatim.)
 
 5. Continue the main loop immediately — do NOT wait for the expansion agent to finish.
+
+### Daily arxiv sweep
+
+Ongo watches user-seeded topics for fresh arxiv preprints on a 24h cadence via `bin/ongo-arxiv-daily`. This runs alongside — not instead of — directive-weighted auto-expansion: expansion synthesises across kendb; the arxiv sweep only pulls in raw new preprints matching a topic's `search_query` and stashes them in kendb so later expansion runs can read/relate them.
+
+**Seeding topics.** The user (or ongo itself, during a self-improvement cycle) seeds interests as `ongo-arxiv-topic` publications. Key = short slug (`distributional-rl`, `lora-fine-tune`), title = an arxiv API `search_query` expression (`all:"distributional reinforcement learning"`, `cat:cs.LG AND all:"LoRA"`), notes = free-form context on why the topic matters. Use the idempotent ensure-then-add pattern:
+
+```bash
+${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-arxiv-topic 2>/dev/null || ${CLAUDE_SKILL_DIR}/bin/ken pubkind add ongo-arxiv-topic "A topic ongo watches for new arxiv preprints. The key is a short slug; the title is an arxiv-API search_query expression; notes are free-form context."
+${CLAUDE_SKILL_DIR}/bin/ken add ongo-arxiv-topic -k <slug> --title '<search_query>'
+```
+
+**Tick-loop hook.** After the auto-expansion / self-improvement checks in each tick: if `time.time() - state["last_arxiv_daily"] >= 86400` AND `status == "ok"` AND `mode == "normal"`, run:
+
+```bash
+${CLAUDE_SKILL_DIR}/bin/ongo-arxiv-daily --channel "$CHANNEL"
+```
+
+Then update `state["last_arxiv_daily"]` to the current unix epoch and write state back. Run in the foreground if it returns quickly (a few topics, a handful of new papers per topic); if the topic count grows large, dispatch as a background subagent to keep the tick lean — same memory-tier gate as auto-expansion. Skip on `status == "error"` (rate-limit / API error) and while `mode == "fast"` (a live conversation must not be delayed by network fetches). Initial state ships `"last_arxiv_daily": 0` so the very first eligible tick runs a sweep.
+
+**What the sweep does.** For each `ongo-arxiv-topic` seed the script HTTP-GETs `http://export.arxiv.org/api/query?search_query=<title>&sortBy=submittedDate&sortOrder=descending&max_results=<limit>` (stdlib `urllib` only — no `requests` / `feedparser`), parses the Atom feed with `xml.etree.ElementTree`, drops entries older than `--window-hours` (default 26; 2h overlap protects a slightly late cron), dedups against every existing `arxiv` publication in kendb (comparing bare ids — `arXiv:` prefix and trailing `vN` versions stripped), then for each remaining new entry: `ken add arxiv -k <id> --title <title>`, writes a note file with authors / category / published / topic / URL / abstract, `ken add note -k <notepath>`, and `ken relate` the arxiv publication to both the note (holds the body) and the topic (records why it was picked up). Digest posted to `$CHANNEL` only if ≥ 1 new paper landed. Prints a JSON summary `{topics, new, posted, errors}` on stdout for the tick logger.
+
+**Options.** `--dry-run` (no ken writes, no Slack — prints the summary), `--no-slack` (write to kendb but skip the digest), `--limit N` (results per topic per query, default 25), `--window-hours H` (default 26). Per-topic HTTP failures continue to the next topic and are surfaced in the summary; exit 2 only if every topic errored, exit 3 if ken is missing.
+
+**Digest publication (`ongo-digest`).** After the sweep, if ≥ 1 new paper landed, the script publishes exactly one `ongo-digest` publication summarising that run: key = ISO date (`YYYY-MM-DD`), title = per-topic paper counts, body (attached via a related-to `note`, mirroring the arxiv-abstract pattern) = markdown paper list grouped by topic with abstract links. Same-day re-runs (dev/testing) key on `YYYY-MM-DD-HH:MM` to avoid collisions. `bin/ongo-site` surfaces these on a dedicated **Digests** tab (`digests.html`) with per-digest detail pages under `items/<slug>.html` — first-class site view, **no `ongo-web` marker required**: any `ongo-digest` publication is automatically web-visible. Empty sweeps (`new: 0`) do not create a digest publication.
+
+#### How topics are chosen
+
+Topics live in kendb as `ongo-arxiv-topic` publications. Each has a slug key, an arxiv-API `search_query` title, and free-form context notes. There is no ranking or weighting — the sweep iterates over every active topic on every tick.
+
+- **Manual seeding (primary path).** The user runs the idempotent ensure-then-add pattern to register a topic:
+  ```bash
+  ${CLAUDE_SKILL_DIR}/bin/ken pubkind show ongo-arxiv-topic 2>/dev/null || ${CLAUDE_SKILL_DIR}/bin/ken pubkind add ongo-arxiv-topic "<description>"
+  ${CLAUDE_SKILL_DIR}/bin/ken add ongo-arxiv-topic -k distributional-rl --title 'all:"distributional reinforcement learning"'
+  ${CLAUDE_SKILL_DIR}/bin/ken add ongo-arxiv-topic -k lora --title 'cat:cs.LG AND all:"low-rank adaptation"'
+  ```
+  Any arxiv-API [search_query expression](https://info.arxiv.org/help/api/user-manual.html#query_details) works (`all:`, `ti:`, `abs:`, `au:`, `cat:` combined with `AND`/`OR`). The slug is what shows up in per-topic headings in the digest.
+- **Selection at run time.** On each 24h sweep tick, `ongo-arxiv-daily` iterates over EVERY active `ongo-arxiv-topic` publication — no ranking or weighting. One arxiv-API query per topic per run. Dedup happens per-topic and across the union of all existing `arxiv` publications (bare id, `arXiv:` prefix and trailing `vN` versions stripped).
+- **Curation.** Users prune stale topics with `${CLAUDE_SKILL_DIR}/bin/ongo-delete pub --key <slug>` (or `ongo-delete pub --kind ongo-arxiv-topic` with `--dry-run` first for a bulk sweep). The daily sweep does not auto-retire topics; retirement is an explicit user action.
+- **Relationship to `ongo-exploration`.** The older `ongo-exploration` pubkind steers auto-expansion topic choice for the deep-notes rotation (Tick step 7). `ongo-arxiv-topic` is a separate mechanism specifically for the daily preprint sweep — the two do not interact today: an `ongo-exploration` directive does not influence arxiv topic weighting, and an `ongo-arxiv-topic` seed does not steer auto-expansion.
 
 ## Self-Improvement
 

@@ -218,6 +218,32 @@ def fetch_notes_body(conn, pub_id):
     return "\n\n".join(bodies).strip()
 
 
+def fetch_digest_body(conn, pub_id):
+    """Return the body text for an ``ongo-digest`` publication, or ``""``.
+
+    Digests keep their body on a related-to ``note`` publication (mirrors
+    the arxiv-abstract pattern in ``ongo-arxiv-daily``): the digest is
+    keyed by ISO date (nice, sortable URL slug), and the paper list lives
+    on a separate note whose filesystem-path key auto-loads the file body
+    into ken's ``notes`` table. Follow ``related-to`` edges from the
+    digest (subject side) to any related note and concatenate their
+    bodies. Deterministic ordering (relationship id ASC) so re-runs
+    produce byte-stable output.
+    """
+    rows = conn.execute(
+        "SELECT n.body AS body "
+        "FROM relationships r "
+        "JOIN publications p ON p.id = r.object "
+        "LEFT JOIN notes n ON n.publication = p.id "
+        "WHERE r.subject = ? AND r.kind = 'related-to' "
+        "AND p.kind = 'note' "
+        "ORDER BY r.id",
+        (pub_id,),
+    ).fetchall()
+    bodies = [r["body"] for r in rows if r["body"]]
+    return "\n\n".join(bodies).strip()
+
+
 def fetch_related(conn, pub_id):
     """Return (kind, other_pub_id) for every relationship touching pub_id."""
     out = []
@@ -1261,6 +1287,7 @@ def page_shell(site_title, body, crumb_html, depth, with_katex=False,
 </div>
 <nav class="top">
 <a href="{up}index.html">Index</a>
+<a href="{up}digests.html">Digests</a>
 <button id="rand-article" class="rand" type="button"
 aria-label="Go to a random article">&#127922;</button>
 <button id="theme-toggle" class="theme" type="button"
@@ -1361,6 +1388,9 @@ def run_qa(site_dir, log):
     idx = os.path.join(site_dir, "index.html")
     if os.path.isfile(idx):
         pages.append(idx)
+    dig = os.path.join(site_dir, "digests.html")
+    if os.path.isfile(dig):
+        pages.append(dig)
     items_dir = os.path.join(site_dir, "items")
     if os.path.isdir(items_dir):
         pages.extend(
@@ -1518,6 +1548,63 @@ def _build_into(args, out_dir, work_dir):
             "sort_ts": sort_ts,
             "page_path": f"items/{slug}.html",
         }
+
+    # ongo-digest publications are a first-class site view — surfaced on
+    # the Digests tab (digests.html) without needing an ongo-web marker.
+    # Each digest gets its own item page under items/<slug>.html via the
+    # normal render pipeline. The body lives on a related-to `note`
+    # (fetch_digest_body); if no related note is found we fall back to
+    # the standard resolver chain (title-only body).
+    digest_pubs = ken_list(ken, db_path, "ongo-digest")
+    log.append(f"ongo-digest publications: {len(digest_pubs)}")
+    digest_pub_ids = set()
+    for d in digest_pubs:
+        pub_id = d.get("id")
+        if not pub_id:
+            continue
+        pub = fetch_publication(conn, pub_id)
+        if pub is None:
+            continue
+        # Skip a digest already published via an ongo-web marker (unlikely,
+        # but avoids clobbering the marker-driven item).
+        if pub["id"] in items:
+            continue
+        body = fetch_digest_body(conn, pub["id"])
+        if not body:
+            # Fall back to the standard chain, but keep the digest visible
+            # even title-only rather than skipping it entirely.
+            source = resolve_source(conn, pub, log, ken, db_path)
+            if source is None:
+                log.append(
+                    f"  WARNING: ongo-digest {pub['id']} has no body "
+                    f"(no related-to note, no fallback) — skipping"
+                )
+                continue
+        else:
+            source = {"kind": "markdown", "body": body}
+        display = (pub["title"] or pub["key"] or "Untitled digest")[:200]
+        # Digest slug is `digest-<iso-date>` so URLs are predictable and
+        # per-day; the title's long per-topic breakdown would otherwise
+        # produce a slug truncated at 80 chars.
+        digest_slug_base = pub["key"] or slugify(display, pub["id"][:8])
+        slug = slugify(f"digest-{digest_slug_base}", pub["id"][:8])
+        try:
+            created_at = pub["created_at"]
+        except (IndexError, KeyError):
+            created_at = None
+        sort_ts = created_at or "0000-00-00 00:00:00"
+        items[pub["id"]] = {
+            "pub_id": pub["id"],
+            "display": display,
+            "slug": slug,
+            "source": source,
+            "date_label": sort_ts,
+            "sort_ts": sort_ts,
+            "page_path": f"items/{slug}.html",
+            "is_digest": True,
+            "digest_key": pub["key"] or "",
+        }
+        digest_pub_ids.add(pub["id"])
 
     if not items:
         log.append("  no resolvable published items — site will be empty")
@@ -1722,6 +1809,50 @@ def _build_into(args, out_dir, work_dir):
         fh.write(
             page_shell(
                 args.site_title, "\n".join(index_body), "", depth=0,
+                item_paths=item_paths,
+            )
+        )
+
+    # Digests tab: reverse-chron flat list of every ongo-digest item.
+    # Rendered even when empty so the nav link always resolves; the page
+    # then shows a friendly empty state instead of a 404.
+    digest_items = [it for it in global_order if it.get("is_digest")]
+    digests_body = [
+        '<p class="lede">Daily arxiv digests</p>',
+        '<h1 class="page-title">Digests</h1>',
+    ]
+    if not digest_items:
+        digests_body.append(
+            '<p class="intro">No digests yet. Seed an '
+            '<code>ongo-arxiv-topic</code> and wait for '
+            '<code>ongo-arxiv-daily</code> to publish one.</p>'
+        )
+    else:
+        digests_body.append(
+            '<p class="intro">%d digest%s, newest first. One per daily '
+            'arxiv sweep with new preprints.</p>'
+            % (len(digest_items), "" if len(digest_items) == 1 else "s")
+        )
+        digests_body.append('<ul class="index">')
+        for item in digest_items:
+            digests_body.append(
+                '<li><a href="%s"><span class="ititle">%s</span>'
+                '<span class="idate">%s</span></a></li>'
+                % (
+                    html.escape(item["page_path"]),
+                    html.escape(item["display"]),
+                    html.escape(item["date_label"]),
+                )
+            )
+        digests_body.append("</ul>")
+
+    with open(
+        os.path.join(work_dir, "digests.html"), "w", encoding="utf-8"
+    ) as fh:
+        fh.write(
+            page_shell(
+                args.site_title, "\n".join(digests_body), "", depth=0,
+                page_title="Digests",
                 item_paths=item_paths,
             )
         )
