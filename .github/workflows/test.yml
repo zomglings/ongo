@@ -1,0 +1,28 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned Ken v3
+        run: |
+          curl -fsSL https://github.com/zomglings/ken/releases/download/v3/ken-x86_64-linux -o /usr/local/bin/ken
+          echo "895eeb32982704b007a419015da7cb920e267f28b9a8e3fce601e3f1acaf0f9c  /usr/local/bin/ken" | sha256sum --check --strict
+          chmod +x /usr/local/bin/ken
+          test "$(ken version)" = 3
+      - name: Compile and test
+        run: |
+          python3 -m py_compile plugins/ongo/bin/ongo plugins/ongo/lib/ongo/*.py
+          python3 -m unittest discover -s plugins/ongo/tests -p 'test_*.py' -v
+      - name: Validate Claude Code plugin
+        run: |
+          npm install --global @anthropic-ai/claude-code
+          claude plugin validate --strict plugins/ongo

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ongo-arxiv-daily — sweep arxiv for new preprints matching seeded topics.
+"""`ongo arxiv sweep` — import new preprints matching seeded topics.
 
 Reads user-seeded topics of kind ``ongo-arxiv-topic`` (key = short slug,
 title = arxiv API ``search_query`` expression), queries the arxiv Atom API
@@ -30,9 +30,11 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
+from .errors import OngoArgumentParser
+
 
 ARXIV_API = "http://export.arxiv.org/api/query"
-USER_AGENT = "ongo-arxiv-daily/0.1 (+http://ongo.ergodic.xyz)"
+USER_AGENT = "ongo-arxiv-sweep/0.4 (+http://ongo.ergodic.xyz)"
 HTTP_TIMEOUT = 30
 DIGEST_PAPER_CAP = 30
 
@@ -55,39 +57,46 @@ ONGO_DIGEST_DESCRIPTION = (
 
 # ---------- ken discovery ---------------------------------------------------
 
-def find_ken() -> str:
-    """Locate the ken binary. Prefers $CLAUDE_SKILL_DIR, then script-relative,
-    finally the deployed skill cache path.
-    """
-    skill_dir = os.environ.get("CLAUDE_SKILL_DIR")
-    if skill_dir:
-        cand = os.path.join(skill_dir, "bin", "ken")
-        if os.path.isfile(cand):
-            return cand
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    cand = os.path.join(script_dir, "ken")
-    if os.path.isfile(cand):
-        return cand
-    return (
-        "/home/claude/.claude/plugins/cache/ongo/ongo/0.1.0/skills/ongo/bin/ken"
-    )
+def find_ken(explicit=None, db=None) -> list[str]:
+    """Resolve the selected Ken v3 binary and database."""
+    from .ken import resolve_db, resolve_ken
+
+    binary = resolve_ken(explicit)
+    return [binary, "-D", resolve_db(binary, db)]
 
 
-def ken(ken_bin: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+def ken(ken_bin: list[str], *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [ken_bin, *args], capture_output=True, text=True, check=check
+        [*ken_bin, *args], capture_output=True, text=True, check=check
     )
 
 
-def ken_ensure_pubkind(ken_bin: str, kind: str, description: str) -> None:
-    """Idempotent ensure — matches Startup step 3's ensure-then-add pattern."""
+def ken_load(ken_bin: list[str], payload: dict) -> dict:
+    """Commit a publication graph through one Ken transaction."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", encoding="utf-8", delete=False
+    ) as handle:
+        json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+        path = handle.name
+    try:
+        result = ken(ken_bin, "load", path)
+        return json.loads(result.stdout)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def ken_ensure_pubkind(ken_bin: list[str], kind: str, description: str) -> None:
+    """Idempotently ensure a supporting publication kind exists."""
     r = subprocess.run(
-        [ken_bin, "pubkind", "show", kind], capture_output=True, text=True
+        [*ken_bin, "pubkind", "show", kind], capture_output=True, text=True
     )
     if r.returncode == 0:
         return
     subprocess.run(
-        [ken_bin, "pubkind", "add", kind, description],
+        [*ken_bin, "pubkind", "add", kind, description],
         capture_output=True, text=True, check=True,
     )
 
@@ -110,9 +119,9 @@ def normalize_arxiv_id(raw: str) -> str:
     return s
 
 
-def load_known_arxiv_ids(ken_bin: str) -> set[str]:
+def load_known_arxiv_ids(ken_bin: list[str]) -> set[str]:
     r = subprocess.run(
-        [ken_bin, "list", "--kind", "arxiv"], capture_output=True, text=True
+        [*ken_bin, "list", "--kind", "arxiv"], capture_output=True, text=True
     )
     if r.returncode != 0:
         raise RuntimeError(f"ken list --kind arxiv failed: {r.stderr.strip()}")
@@ -222,14 +231,11 @@ def fetch_topic(search_query: str, limit: int) -> bytes:
 
 # ---------- ken writes ------------------------------------------------------
 
-def publish_paper(ken_bin: str, entry: dict, topic_key: str,
+def publish_paper(ken_bin: list[str], entry: dict, topic_key: str,
                   topic_id: str) -> tuple[str, str]:
     """Add arxiv publication, attach an abstract-body note, relate both to
     the topic. Returns (arxiv_pub_id, note_pub_id).
     """
-    r = ken(ken_bin, "add", "arxiv", "-k", entry["id"], "--title", entry["title"])
-    arxiv_pub_id = r.stdout.strip().splitlines()[-1]
-
     body = (
         f"Authors: {', '.join(entry['authors'])}\n"
         f"Category: {entry['primary_category']}\n"
@@ -239,24 +245,32 @@ def publish_paper(ken_bin: str, entry: dict, topic_key: str,
         f"\n"
         f"{entry['summary']}\n"
     )
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".md", delete=False, prefix=f"arxiv-{entry['id']}-"
-    ) as f:
-        f.write(body)
-        note_path = f.name
-
     note_title = f"arxiv:{entry['id']} abstract ({topic_key})"
-    r = ken(ken_bin, "add", "note", "-k", note_path, "--title", note_title)
-    note_pub_id = r.stdout.strip().splitlines()[-1]
-
-    # arxiv --related-to--> note (holds the abstract body)
-    ken(ken_bin, "relate", "-s", arxiv_pub_id, "-o", note_pub_id,
-        "-r", "related-to")
-    # arxiv --related-to--> topic (records why this paper was picked up)
-    ken(ken_bin, "relate", "-s", arxiv_pub_id, "-o", topic_id,
-        "-r", "related-to")
-
-    return arxiv_pub_id, note_pub_id
+    loaded = ken_load(
+        ken_bin,
+        {
+            "publications": [
+                {
+                    "ref": "paper",
+                    "kind": "arxiv",
+                    "key": entry["id"],
+                    "title": entry["title"],
+                },
+                {
+                    "ref": "abstract",
+                    "kind": "note",
+                    "key": f"ongo-arxiv:{entry['id']}:{topic_key}:abstract",
+                    "title": note_title,
+                },
+            ],
+            "relationships": [
+                {"subject": "paper", "object": "abstract", "kind": "related-to"},
+                {"subject": "paper", "object": topic_id, "kind": "related-to"},
+            ],
+            "notes": [{"publication": "abstract", "body": body}],
+        },
+    )
+    return loaded["refs"]["paper"], loaded["refs"]["abstract"]
 
 
 # ---------- digest ----------------------------------------------------------
@@ -293,7 +307,7 @@ def build_digest(results: dict[str, list[dict]],
 
 
 def publish_ongo_digest(
-    ken_bin: str,
+    ken_bin: list[str],
     results: dict,
     errors: dict,
     iso_date: str,
@@ -304,10 +318,9 @@ def publish_ongo_digest(
     Idempotently ensures the ``ongo-digest`` pubkind, then adds a digest
     publication keyed by ISO date (``YYYY-MM-DD``). If a digest already
     exists for that date (rare — dev/testing case), an ``HH:MM`` suffix
-    is appended to disambiguate. The paper list body is stashed on a
-    related-to ``note`` publication (mirrors the arxiv abstract pattern),
-    which auto-loads the file body into ken's ``notes`` table so
-    ``ongo-site`` can render it. Returns (digest_id, digest_key, title).
+    is appended to disambiguate. The paper list body and related note are
+    committed in one ``ken load`` transaction so ``ongo site build`` can
+    render them. Returns (digest_id, digest_key, title).
     """
     ken_ensure_pubkind(ken_bin, "ongo-digest", ONGO_DIGEST_DESCRIPTION)
 
@@ -324,7 +337,7 @@ def publish_ongo_digest(
 
     # Key = ISO date; suffix HH:MM only if the date is already taken.
     r = subprocess.run(
-        [ken_bin, "list", "--kind", "ongo-digest"],
+        [*ken_bin, "list", "--kind", "ongo-digest"],
         capture_output=True, text=True,
     )
     existing_keys: set[str] = set()
@@ -369,30 +382,30 @@ def publish_ongo_digest(
         lines.append("")
     body = "\n".join(lines)
 
-    # Write body to a tempfile — the note-kind publication auto-loads it.
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".md", delete=False,
-        prefix=f"ongo-digest-{key}-",
-    ) as f:
-        f.write(body)
-        note_path = f.name
-
-    # 1. Add the digest publication (title-only; the ISO-date key drives
-    #    the digests-tab index; body lives on the related note below).
-    r = ken(ken_bin, "add", "ongo-digest", "-k", key, "--title", title)
-    digest_id = r.stdout.strip().splitlines()[-1]
-
-    # 2. Add the body as a `note` publication (auto-loaded from disk),
-    #    relate digest --related-to--> note. ongo-site follows this edge.
-    r = ken(
-        ken_bin, "add", "note", "-k", note_path,
-        "--title", f"arxiv digest body — {key}",
+    loaded = ken_load(
+        ken_bin,
+        {
+            "publications": [
+                {
+                    "ref": "digest",
+                    "kind": "ongo-digest",
+                    "key": key,
+                    "title": title,
+                },
+                {
+                    "ref": "body",
+                    "kind": "note",
+                    "key": f"ongo-digest:{key}:body",
+                    "title": f"arxiv digest body — {key}",
+                },
+            ],
+            "relationships": [
+                {"subject": "digest", "object": "body", "kind": "related-to"}
+            ],
+            "notes": [{"publication": "body", "body": body}],
+        },
     )
-    note_id = r.stdout.strip().splitlines()[-1]
-    ken(ken_bin, "relate", "-s", digest_id, "-o", note_id,
-        "-r", "related-to")
-
-    return digest_id, key, title
+    return loaded["refs"]["digest"], key, title
 
 
 def post_digest(channel: str, message: str) -> bool:
@@ -411,11 +424,13 @@ def post_digest(channel: str, message: str) -> bool:
 # ---------- main ------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(
+    p = OngoArgumentParser(
         description="Daily arxiv sweep for ongo-arxiv-topic seeds."
     )
     p.add_argument("--channel", default=None,
                    help="Slack channel id for the digest.")
+    p.add_argument("--ken", default=None, help="Path to Ken v3.")
+    p.add_argument("--db", default=None, help="Path to the Ken database.")
     p.add_argument("--limit", type=int, default=25,
                    help="Max results per topic per query.")
     p.add_argument("--window-hours", type=float, default=26.0,
@@ -427,17 +442,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="Do ken writes but skip Slack digest.")
     args = p.parse_args(argv)
 
-    ken_bin = find_ken()
-    if not os.path.isfile(ken_bin):
-        sys.stderr.write(f"ken binary not found at {ken_bin}\n")
-        return 3
+    ken_bin = find_ken(args.ken, args.db)
 
     if not args.dry_run:
         ken_ensure_pubkind(ken_bin, "ongo-arxiv-topic", PUBKIND_DESCRIPTION)
 
     # List topics.
     r = subprocess.run(
-        [ken_bin, "list", "--kind", "ongo-arxiv-topic"],
+        [*ken_bin, "list", "--kind", "ongo-arxiv-topic"],
         capture_output=True, text=True,
     )
     if r.returncode != 0:

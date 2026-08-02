@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""ongo-poll — robust Slack poll for the ongo tick loop.
+"""`ongo slack poll` — robust Slack poll for the Ongo tick loop.
 
 Usage:
-    ongo-poll <CHANNEL> <LAST_USER_TS>
+    ongo slack poll <CHANNEL> <LAST_USER_TS>
 
 Prints JSON. On success:
     {"status":"ok","total_seen":N,"user_count":N,
@@ -188,8 +188,17 @@ def poll(channel, last_user_ts):
     }
 
 
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args in (["-h"], ["--help"]):
+        print("usage: ongo slack poll <CHANNEL> <LAST_USER_TS>")
+        return 0
+    if len(args) != 2:
+        sys.stderr.write("usage: ongo slack poll <CHANNEL> <LAST_USER_TS>\n")
+        return 2
+    print(json.dumps(poll(args[0], args[1])))
+    return 0
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        sys.stderr.write("usage: ongo-poll <CHANNEL> <LAST_USER_TS>\n")
-        sys.exit(2)
-    print(json.dumps(poll(sys.argv[1], sys.argv[2])))
+    raise SystemExit(main())

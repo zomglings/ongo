@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-r"""ongo-site — Generate a self-contained static site from a kendb publish set.
+r"""`ongo site build` — generate a static site from a Ken publish set.
 
-Nothing appears on the site unless an `ongo-web` publication references it.
+Research records appear only when an `ongo-web` publication references them;
+daily `ongo-digest` publications are the one automatic collection.
 An `ongo-web` entry is the *publish marker*:
 
     key   = the target publication's id  (or its key)
@@ -15,10 +16,7 @@ The generator:
      a slug -> ~/.local/share/ken/notes/<slug>.md or research-notes/**.md
      match, the kendb note body via `ken show --json` (zomglings/ken#8,
      ken >= v3 — the supported CLI read path for ken's first-class `notes`
-     table; on older ken without `ken show` it degrades gracefully to a
-     compatibility fallback that reads the same first-class `notes` data
-     by issuing direct SQL against ken's internal schema from outside the
-     tool), or finally the publication title.
+     table), or finally the publication title.
   3. Emits the index as a SINGLE GLOBAL FLAT LIST of every published item
      (no topic grouping, no per-topic nav): reverse-chronological (newest
      first), ties broken alphabetically by title (A->Z). Each row shows the
@@ -36,11 +34,11 @@ directory cleanly and produces deterministic output. KaTeX vendoring degrades
 gracefully (raw math, logged to build.log) and never crashes the build.
 
 Usage:
-    ongo-site [--ken PATH] [--db PATH] [--out DIR] [--site-title TITLE]
+    ongo site build [--ken PATH] [--db PATH] [--out DIR] [--site-title TITLE]
               [--base-url URL]
 
-The ken binary path may also be set via the KEN env var. The kendb path
-defaults to ~/.local/share/ken/ken.db (respects XDG_DATA_HOME).
+The Ken binary and database use the same resolution rules as the rest of the
+plugin (`ONGO_KEN`, `ONGO_KEN_DB`, plugin data, then Ken's own default).
 """
 
 import argparse
@@ -50,15 +48,16 @@ import json
 import os
 import re
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tarfile
 import tempfile
 import urllib.request
 
+from .errors import OngoArgumentParser
 
-DEFAULT_KEN = "/home/claude/.claude/plugins/cache/ongo/ongo/0.1.0/skills/ongo/bin/ken"
+
+DEFAULT_KEN = "ken"
 
 # KaTeX is vendored LOCALLY into site/assets/katex/ so the published site
 # fetches no external assets at runtime. The build may fetch the tarball
@@ -91,57 +90,54 @@ NOTE_SEARCH_ROOTS = (
 # kendb access
 # --------------------------------------------------------------------------- #
 
-def default_db_path():
-    data_home = os.environ.get(
-        "XDG_DATA_HOME", os.path.expanduser("~/.local/share")
-    )
-    return os.path.join(data_home, "ken", "ken.db")
-
-
 def resolve_ken(arg_ken):
-    """Resolve the ken binary path from arg, env, or default."""
-    cand = arg_ken or os.environ.get("KEN") or DEFAULT_KEN
-    if os.path.isfile(cand) and os.access(cand, os.X_OK):
-        return cand
-    found = shutil.which("ken")
-    if found:
-        return found
-    return cand  # let the later subprocess call surface the error
+    """Resolve Ken using the plugin-wide precedence rules."""
+    from .ken import resolve_ken as resolve_plugin_ken
+
+    return resolve_plugin_ken(arg_ken)
 
 
-def ken_list(ken, db_path, kind):
-    """Run `ken list --kind <kind>` and return the parsed JSON array."""
-    cmd = [ken, "-D", db_path, "list", "--kind", kind]
-    try:
-        out = subprocess.run(
-            cmd, capture_output=True, text=True, check=True
-        ).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        stderr = getattr(exc, "stderr", "") or str(exc)
-        raise SystemExit(
-            f"error: `ken list --kind {kind}` failed: {stderr.strip()}"
-        )
-    out = out.strip()
-    if not out:
-        return []
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"error: could not parse ken output for {kind}: {exc}")
-    return data if isinstance(data, list) else []
+def resolve_db_path(ken, arg_db):
+    from .ken import resolve_db
+
+    return resolve_db(ken, arg_db)
 
 
-def ken_show_body(ken, db_path, pub_id, key):
-    """Read a publication's note body via `ken show ... --json` (ken >= v3).
+def ken_list(ken, db_path, kind=None):
+    """Read every matching publication through Ken's paginated CLI."""
+    rows = []
+    offset = 0
+    while True:
+        cmd = [ken, "-D", db_path, "list"]
+        if kind is not None:
+            cmd.extend(["--kind", kind])
+        cmd.extend(["--limit", "500", "--offset", str(offset)])
+        try:
+            out = subprocess.run(
+                cmd, capture_output=True, text=True, check=True
+            ).stdout
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            stderr = getattr(exc, "stderr", "") or str(exc)
+            label = f" --kind {kind}" if kind is not None else ""
+            raise SystemExit(
+                f"error: `ken list{label}` failed: {stderr.strip()}"
+            )
+        try:
+            page = json.loads(out or "[]")
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"error: could not parse ken list output: {exc}")
+        if not isinstance(page, list):
+            raise SystemExit("error: ken list returned a non-array JSON value")
+        rows.extend(page)
+        if len(page) < 500:
+            return rows
+        offset += len(page)
 
-    Returns the body string ("" if the publication has no body), or None if
-    `ken show` is unavailable (older ken without the command, zomglings/ken#8
-    not yet in the deployed binary) or the publication cannot be resolved.
-    The caller treats None *and* "" as "no kendb body, continue the chain",
-    so this degrades gracefully on older ken (it just falls through).
 
-    Prefer the full uuid (`show <id>`); fall back to `--key` only if no id
-    is available. `ken show --key` returns the earliest-inserted match.
+def ken_show_record(ken, db_path, pub_id, key):
+    """Read a publication through `ken show ... --json` (Ken v3).
+
+    Prefer the full UUID; fall back to ``--key`` only if no id is available.
     """
     if pub_id:
         cmd = [ken, "-D", db_path, "show", pub_id, "--json"]
@@ -153,9 +149,6 @@ def ken_show_body(ken, db_path, pub_id, key):
         proc = subprocess.run(cmd, capture_output=True, text=True)
     except (OSError, FileNotFoundError):
         return None
-    # Non-zero exit: not found, or older ken that lacks the `show` command
-    # (it emits "Unknown command" / usage and exits non-zero). Either way
-    # there is no JSON body to use — fall through to the rest of the chain.
     if proc.returncode != 0:
         return None
     out = (proc.stdout or "").strip()
@@ -164,10 +157,16 @@ def ken_show_body(ken, db_path, pub_id, key):
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
-        # Older ken without --json could print plain text; treat as
-        # unavailable rather than guessing at a format.
         return None
     if not isinstance(data, dict):
+        return None
+    return data
+
+
+def ken_show_body(ken, db_path, pub_id, key):
+    """Return a publication note body through Ken's supported CLI."""
+    data = ken_show_record(ken, db_path, pub_id, key)
+    if data is None:
         return None
     body = data.get("body")
     if not isinstance(body, str):
@@ -175,86 +174,75 @@ def ken_show_body(ken, db_path, pub_id, key):
     return body
 
 
-def db_connect(db_path):
-    if not os.path.exists(db_path):
-        raise SystemExit(
-            f"error: kendb not found at {db_path} (run `ken init` first)"
-        )
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    return conn
+class KenView:
+    """Read-only site projection built exclusively through the Ken v3 CLI."""
+
+    def __init__(self, ken, db_path):
+        self.ken = ken
+        self.db_path = db_path
+        self.rows = []
+        self.by_id = {}
+        self.by_key = {}
+        self._shown = {}
+        for rank, raw in enumerate(ken_list(ken, db_path)):
+            row = dict(raw)
+            row["created_at"] = row.get("created_at")
+            row["list_rank"] = rank
+            self.rows.append(row)
+            self.by_id[row["id"]] = row
+            if row.get("kind") != "ongo-web" and row.get("key"):
+                self.by_key.setdefault(row["key"], row)
+
+    def publication(self, identifier):
+        return self.by_id.get(identifier)
+
+    def publication_by_key(self, key):
+        return self.by_key.get(key)
+
+    def show(self, pub_id):
+        if pub_id not in self._shown:
+            row = self.by_id.get(pub_id)
+            self._shown[pub_id] = (
+                ken_show_record(self.ken, self.db_path, pub_id, row.get("key") if row else None)
+                if row is not None
+                else None
+            )
+        return self._shown[pub_id]
 
 
-def fetch_publication(conn, pub_id):
-    return conn.execute(
-        "SELECT id, key, kind, title, created_at "
-        "FROM publications WHERE id = ?",
-        (pub_id,),
-    ).fetchone()
+def fetch_publication(view, pub_id):
+    return view.publication(pub_id)
 
 
-def fetch_publication_by_key(conn, key):
+def fetch_publication_by_key(view, key):
     """Resolve a key to a publication, never to an ongo-web marker.
 
     An ongo-web marker's own key equals the slug/key of its target, so a
     naive `WHERE key = ?` would match the marker itself. Exclude the marker
     kind and prefer a deterministic order.
     """
-    return conn.execute(
-        "SELECT id, key, kind, title, created_at FROM publications "
-        "WHERE key = ? AND kind != 'ongo-web' "
-        "ORDER BY created_at, id LIMIT 1",
-        (key,),
-    ).fetchone()
+    return view.publication_by_key(key)
 
 
-def fetch_notes_body(conn, pub_id):
-    """Concatenate all note bodies for a publication (deterministic order)."""
-    rows = conn.execute(
-        "SELECT body FROM notes WHERE publication = ? ORDER BY id",
-        (pub_id,),
-    ).fetchall()
-    bodies = [r["body"] for r in rows if r["body"]]
-    return "\n\n".join(bodies).strip()
-
-
-def fetch_digest_body(conn, pub_id):
+def fetch_digest_body(view, pub_id):
     """Return the body text for an ``ongo-digest`` publication, or ``""``.
 
-    Digests keep their body on a related-to ``note`` publication (mirrors
-    the arxiv-abstract pattern in ``ongo-arxiv-daily``): the digest is
-    keyed by ISO date (nice, sortable URL slug), and the paper list lives
-    on a separate note whose filesystem-path key auto-loads the file body
-    into ken's ``notes`` table. Follow ``related-to`` edges from the
-    digest (subject side) to any related note and concatenate their
-    bodies. Deterministic ordering (relationship id ASC) so re-runs
-    produce byte-stable output.
+    Digests keep their body on a subject-side ``related-to`` note. Ken v3
+    returns those relationships and note bodies through ``show --json``.
     """
-    rows = conn.execute(
-        "SELECT n.body AS body "
-        "FROM relationships r "
-        "JOIN publications p ON p.id = r.object "
-        "LEFT JOIN notes n ON n.publication = p.id "
-        "WHERE r.subject = ? AND r.kind = 'related-to' "
-        "AND p.kind = 'note' "
-        "ORDER BY r.id",
-        (pub_id,),
-    ).fetchall()
-    bodies = [r["body"] for r in rows if r["body"]]
+    record = view.show(pub_id) or {}
+    bodies = []
+    for relation in record.get("relationships", []):
+        if relation.get("role") != "subject" or relation.get("relkind") != "related-to":
+            continue
+        related = view.publication(relation.get("publication"))
+        if related is None or related.get("kind") != "note":
+            continue
+        shown = view.show(related["id"]) or {}
+        body = shown.get("body")
+        if isinstance(body, str) and body:
+            bodies.append(body)
     return "\n\n".join(bodies).strip()
-
-
-def fetch_related(conn, pub_id):
-    """Return (kind, other_pub_id) for every relationship touching pub_id."""
-    out = []
-    for row in conn.execute(
-        "SELECT kind, subject, object FROM relationships "
-        "WHERE subject = ? OR object = ?",
-        (pub_id, pub_id),
-    ):
-        other = row["object"] if row["subject"] == pub_id else row["subject"]
-        out.append((row["kind"], other))
-    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -283,7 +271,7 @@ def find_slug_file(slug):
     return None
 
 
-def resolve_source(conn, pub, log, ken, db_path):
+def resolve_source(view, pub, log, ken, db_path):
     """Resolve a publication to its renderable source.
 
     Returns a dict: {kind: 'markdown'|'pdf'|'text', body|path}
@@ -291,17 +279,26 @@ def resolve_source(conn, pub, log, ken, db_path):
 
     Resolution order: a filesystem .md/.pdf/.tex named by the publication
     key, a slug match under the note roots, the kendb note body read via
-    `ken show --json` (zomglings/ken#8, ken >= v3 — the supported CLI read
-    path for ken's first-class `notes` table), and finally the title.
-    The `ken show` step degrades gracefully on older ken (the command is
-    absent / errors): `ken_show_body` returns None and the chain falls
-    through to the direct-DB-access fallback (direct SQL against ken's
-    internal `notes` schema from outside the tool, for ken < v3), so
-    unresolvable refs still only warn in build.log and the build never
-    crashes.
+    `ken show --json` (the supported Ken v3 read path), and finally the title.
     """
     key = pub["key"]
     title = pub["title"] or ""
+
+    # Experiment roots remain private unless an explicit ongo-web marker
+    # selects them. When selected, render the reviewed protocol and exact
+    # condition matrix rather than exposing the root publication's JSON.
+    if pub["kind"] == "ongo-experiment":
+        try:
+            from .experiments import markdown_view
+            from .ken import KenClient
+
+            client = KenClient(binary=ken, db=db_path)
+            return {"kind": "markdown", "body": markdown_view(client, pub["id"])}
+        except Exception as error:
+            log.append(
+                f"  WARNING: could not render experiment {pub['id']}: {error}"
+            )
+            return None
 
     # 1. key is a filesystem path.
     if key and key.startswith("/"):
@@ -323,29 +320,11 @@ def resolve_source(conn, pub, log, ken, db_path):
                       errors="replace") as fh:
                 return {"kind": "markdown", "body": fh.read()}
 
-    # 3. kendb note body via `ken show --json` (zomglings/ken#8, ken >= v3).
-    #    This replaces the old direct `notes`-table query: `ken show` is the
-    #    supported CLI for reading a publication's body without coupling to
-    #    the kendb schema. An empty body ("" — publication exists but has no
-    #    note) means "no kendb body", so we continue the chain.
-    show_body = ken_show_body(ken, db_path, pub["id"], key)
+    # 3. Ken v3's supported publication body read path.
+    shown = view.show(pub["id"])
+    show_body = shown.get("body") if shown else None
     if show_body and show_body.strip():
         return {"kind": "markdown", "body": show_body}
-
-    # 3b. Compatibility fallback: ongo-site issues its own direct SQL
-    #     against ken's internal `notes` schema from outside the tool. The
-    #     `notes` table is a first-class ken feature (the canonical store
-    #     for publication bodies); what is downgraded here is *external
-    #     direct-database access* to it, not the table itself. Kept ONLY so
-    #     older deployed ken (without `ken show`, i.e. zomglings/ken#8 not
-    #     yet released) does not regress — `ken_show_body` returns None
-    #     there and we read the same first-class bodies via direct SQL.
-    #     Once every deployed ken is >= v3 this branch becomes dead code
-    #     and can be removed.
-    if show_body is None:
-        body = fetch_notes_body(conn, pub["id"])
-        if body:
-            return {"kind": "markdown", "body": body}
 
     # 4. fall back to the title as the body.
     if title.strip():
@@ -1271,7 +1250,7 @@ def page_shell(site_title, body, crumb_html, depth, with_katex=False,
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<meta name="generator" content="ongo-site">
+<meta name="generator" content="ongo site build">
 <title>{html.escape(doc_title)}</title>
 <script>{THEME_INIT_JS}</script>
 {rand_init}
@@ -1287,6 +1266,7 @@ def page_shell(site_title, body, crumb_html, depth, with_katex=False,
 </div>
 <nav class="top">
 <a href="{up}index.html">Index</a>
+<a href="{up}experiments.html">Experiments</a>
 <a href="{up}digests.html">Digests</a>
 <button id="rand-article" class="rand" type="button"
 aria-label="Go to a random article">&#127922;</button>
@@ -1302,7 +1282,7 @@ mine. ongo is an open, self-hostable autonomous research agent — anyone can
 run their own, with their own topics, sources, and publishing rules. Source
 &amp; documentation:
 <a href="https://github.com/zomglings/ongo" target="_blank" rel="noopener">github.com/zomglings/ongo</a>.</p>
-<p>Generated by <strong>ongo-site</strong> from the kendb publish set
+<p>Generated by <strong>ongo site build</strong> from the kendb publish set
 (kind:&nbsp;<code>ongo-web</code>). Static and self-contained — no external
 runtime assets. Math typeset with locally vendored KaTeX.</p>
 </footer>
@@ -1391,6 +1371,9 @@ def run_qa(site_dir, log):
     dig = os.path.join(site_dir, "digests.html")
     if os.path.isfile(dig):
         pages.append(dig)
+    experiments = os.path.join(site_dir, "experiments.html")
+    if os.path.isfile(experiments):
+        pages.append(experiments)
     items_dir = os.path.join(site_dir, "items")
     if os.path.isdir(items_dir):
         pages.extend(
@@ -1420,7 +1403,7 @@ def run_qa(site_dir, log):
     total = len(pages)
     clean = total - offending
     header = (
-        "ongo-site QA report — %d pages scanned, %d clean, %d with defects, "
+        "ongo site build QA report — %d pages scanned, %d clean, %d with defects, "
         "%d total defect hits\n" % (total, clean, offending, total_defects)
     )
     if offending == 0:
@@ -1447,15 +1430,12 @@ def run_qa(site_dir, log):
 
 
 def build(args):
-    """Generate the site and publish it atomically.
+    """Generate a complete site tree and replace the previous tree safely.
 
-    Atomic publish: build into a sibling temp dir in the SAME parent
-    directory (so os.replace below stays on one filesystem — required
-    for an atomic rename; /tmp would be a different mount), then swap
-    it into place. Readers (e.g. http.server) only ever observe a
-    complete tree: either the previous site or the new one, never a
-    half-written mix. The try/finally guarantees the temp dir is
-    removed on any failure, so a crashed build never leaks it.
+    Build into a sibling directory, then use same-filesystem renames for a
+    staged replacement. If installation of the new tree fails after moving the
+    old tree, ``_build_into`` restores the old tree. There is a tiny name gap
+    between the two renames, but no half-written published tree.
     """
     out_dir = os.path.abspath(args.out)
     parent = os.path.dirname(out_dir) or "."
@@ -1475,7 +1455,7 @@ def build(args):
 
 def _build_into(args, out_dir, work_dir):
     ken = resolve_ken(args.ken)
-    db_path = args.db or default_db_path()
+    db_path = resolve_db_path(ken, args.db)
     old_dir = out_dir + ".old"
 
     log = []
@@ -1487,10 +1467,24 @@ def _build_into(args, out_dir, work_dir):
     markers = ken_list(ken, db_path, "ongo-web")
     log.append(f"ongo-web markers: {len(markers)}")
 
-    conn = db_connect(db_path)
+    view = KenView(ken, db_path)
 
     # Resolve every marker to a published item.
     items = {}  # source_pub_id -> item dict
+    used_slugs = set()
+
+    def claim_slug(display, pub_id, prefix=""):
+        base = slugify(prefix + display, pub_id[:8])
+        candidate = base
+        if candidate in used_slugs:
+            candidate = f"{base}-{pub_id[:8]}"
+        suffix = 2
+        while candidate in used_slugs:
+            candidate = f"{base}-{pub_id[:8]}-{suffix}"
+            suffix += 1
+        used_slugs.add(candidate)
+        return candidate
+
     for m in markers:
         ref = m.get("key") or ""
         nav_title = (m.get("title") or "").strip()
@@ -1500,9 +1494,9 @@ def _build_into(args, out_dir, work_dir):
             )
             continue
 
-        pub = fetch_publication(conn, ref)
+        pub = fetch_publication(view, ref)
         if pub is None:
-            pub = fetch_publication_by_key(conn, ref)
+            pub = fetch_publication_by_key(view, ref)
         if pub is None:
             log.append(
                 f"  WARNING: ongo-web key {ref!r} resolves to no "
@@ -1515,8 +1509,14 @@ def _build_into(args, out_dir, work_dir):
                 f"ongo-web marker — skipping"
             )
             continue
+        if pub["id"] in items:
+            log.append(
+                f"  WARNING: multiple ongo-web markers reference {pub['id']} — "
+                "using the first marker"
+            )
+            continue
 
-        source = resolve_source(conn, pub, log, ken, db_path)
+        source = resolve_source(view, pub, log, ken, db_path)
         if source is None:
             log.append(
                 f"  WARNING: could not resolve a body for "
@@ -1525,7 +1525,7 @@ def _build_into(args, out_dir, work_dir):
             continue
 
         display = nav_title or (pub["title"] or "Untitled")[:120]
-        slug = slugify(display, pub["id"][:8])
+        slug = claim_slug(display, pub["id"])
         # Derive a deterministic date from `created_at`. The column
         # may be absent from a Row when keyed differently; access
         # defensively.
@@ -1538,7 +1538,7 @@ def _build_into(args, out_dir, work_dir):
         # what we want shown in the index. The fallback string sinks
         # missing-created_at rows to the bottom of the global order.
         sort_ts = created_at or "0000-00-00 00:00:00"
-        date_label = sort_ts
+        date_label = created_at or ""
         items[pub["id"]] = {
             "pub_id": pub["id"],
             "display": display,
@@ -1547,6 +1547,8 @@ def _build_into(args, out_dir, work_dir):
             "date_label": date_label,
             "sort_ts": sort_ts,
             "page_path": f"items/{slug}.html",
+            "list_rank": pub.get("list_rank", len(view.rows)),
+            "is_experiment": pub["kind"] == "ongo-experiment",
         }
 
     # ongo-digest publications are a first-class site view — surfaced on
@@ -1562,18 +1564,18 @@ def _build_into(args, out_dir, work_dir):
         pub_id = d.get("id")
         if not pub_id:
             continue
-        pub = fetch_publication(conn, pub_id)
+        pub = fetch_publication(view, pub_id)
         if pub is None:
             continue
         # Skip a digest already published via an ongo-web marker (unlikely,
         # but avoids clobbering the marker-driven item).
         if pub["id"] in items:
             continue
-        body = fetch_digest_body(conn, pub["id"])
+        body = fetch_digest_body(view, pub["id"])
         if not body:
             # Fall back to the standard chain, but keep the digest visible
             # even title-only rather than skipping it entirely.
-            source = resolve_source(conn, pub, log, ken, db_path)
+            source = resolve_source(view, pub, log, ken, db_path)
             if source is None:
                 log.append(
                     f"  WARNING: ongo-digest {pub['id']} has no body "
@@ -1587,7 +1589,7 @@ def _build_into(args, out_dir, work_dir):
         # per-day; the title's long per-topic breakdown would otherwise
         # produce a slug truncated at 80 chars.
         digest_slug_base = pub["key"] or slugify(display, pub["id"][:8])
-        slug = slugify(f"digest-{digest_slug_base}", pub["id"][:8])
+        slug = claim_slug(digest_slug_base, pub["id"], prefix="digest-")
         try:
             created_at = pub["created_at"]
         except (IndexError, KeyError):
@@ -1598,11 +1600,12 @@ def _build_into(args, out_dir, work_dir):
             "display": display,
             "slug": slug,
             "source": source,
-            "date_label": sort_ts,
+            "date_label": created_at or "",
             "sort_ts": sort_ts,
             "page_path": f"items/{slug}.html",
             "is_digest": True,
             "digest_key": pub["key"] or "",
+            "list_rank": pub.get("list_rank", len(view.rows)),
         }
         digest_pub_ids.add(pub["id"])
 
@@ -1620,7 +1623,13 @@ def _build_into(args, out_dir, work_dir):
     # ties A->Z. Deterministic and stable across runs.
     global_order = sorted(
         items.values(),
-        key=lambda x: (_invert_date(x["sort_ts"]), x["display"].lower()),
+        key=lambda x: (
+            0 if x["sort_ts"] != "0000-00-00 00:00:00" else 1,
+            _invert_date(x["sort_ts"])
+            if x["sort_ts"] != "0000-00-00 00:00:00"
+            else f"{x['list_rank']:012d}",
+            x["display"].lower(),
+        ),
     )
 
     # Build a published-set lookup for cross-link resolution.
@@ -1631,9 +1640,9 @@ def _build_into(args, out_dir, work_dir):
 
         def resolver(target):
             # Cross-link to another published note by id/key -> its page.
-            tpub = fetch_publication(conn, target)
+            tpub = fetch_publication(view, target)
             if tpub is None:
-                tpub = fetch_publication_by_key(conn, target)
+                tpub = fetch_publication_by_key(view, target)
             if tpub is not None and tpub["id"] in published_ids:
                 page = items[tpub["id"]]["page_path"]
                 return (up + page, False)
@@ -1813,6 +1822,54 @@ def _build_into(args, out_dir, work_dir):
             )
         )
 
+    # Experiments tab: only explicitly marked experiment roots. Attempt,
+    # result, and artifact records never inherit the root marker.
+    experiment_items = [it for it in global_order if it.get("is_experiment")]
+    experiments_body = [
+        '<p class="lede">Reviewed experiment protocols</p>',
+        '<h1 class="page-title">Experiments</h1>',
+    ]
+    if not experiment_items:
+        experiments_body.append(
+            '<p class="intro">No experiments are published. Add an '
+            '<code>ongo-web</code> marker referencing an experiment root to '
+            'publish its protocol and canonical manifest.</p>'
+        )
+    else:
+        experiments_body.append(
+            '<p class="intro">%d explicitly published experiment%s.</p>'
+            % (
+                len(experiment_items),
+                "" if len(experiment_items) == 1 else "s",
+            )
+        )
+        experiments_body.append('<ul class="index">')
+        for item in experiment_items:
+            experiments_body.append(
+                '<li><a href="%s"><span class="ititle">%s</span>'
+                '<span class="idate">%s</span></a></li>'
+                % (
+                    html.escape(item["page_path"]),
+                    html.escape(item["display"]),
+                    html.escape(item["date_label"]),
+                )
+            )
+        experiments_body.append("</ul>")
+
+    with open(
+        os.path.join(work_dir, "experiments.html"), "w", encoding="utf-8"
+    ) as fh:
+        fh.write(
+            page_shell(
+                args.site_title,
+                "\n".join(experiments_body),
+                "",
+                depth=0,
+                page_title="Experiments",
+                item_paths=item_paths,
+            )
+        )
+
     # Digests tab: reverse-chron flat list of every ongo-digest item.
     # Rendered even when empty so the nav link always resolves; the page
     # then shows a friendly empty state instead of a 404.
@@ -1825,7 +1882,7 @@ def _build_into(args, out_dir, work_dir):
         digests_body.append(
             '<p class="intro">No digests yet. Seed an '
             '<code>ongo-arxiv-topic</code> and wait for '
-            '<code>ongo-arxiv-daily</code> to publish one.</p>'
+            '<code>ongo arxiv sweep</code> to publish one.</p>'
         )
     else:
         digests_body.append(
@@ -1857,8 +1914,6 @@ def _build_into(args, out_dir, work_dir):
             )
         )
 
-    conn.close()
-
     # Drop the KaTeX download scratch dir so it never reaches the published
     # tree (the vendored copy already lives at assets/katex/). Build-time
     # only artifact; runtime stays self-contained and minimal.
@@ -1872,7 +1927,7 @@ def _build_into(args, out_dir, work_dir):
     log.append(f"katex: {'vendored' if katex_ok else 'unavailable (raw)'}")
 
     # QA self-check: scan the freshly generated tree (in work_dir, so the
-    # report ships in the atomically-swapped site) for markdown-render
+    # report ships in the staged replacement tree) for markdown-render
     # defect signatures. Writes qa-report.txt, appends a PASS/FAIL line to
     # the log. Never fails the build — visibility only.
     qa_clean, qa_total, qa_defects, qa_pass = run_qa(work_dir, log)
@@ -1883,22 +1938,26 @@ def _build_into(args, out_dir, work_dir):
     ) as fh:
         fh.write(log_text)
 
-    # --- atomic swap ---------------------------------------------------- #
-    # The new tree in work_dir is now complete. Replace out_dir atomically
-    # so a concurrent reader (http.server) only ever sees a whole tree:
+    # --- staged replacement with rollback ------------------------------ #
+    # The new tree in work_dir is complete before touching the live path:
     #   1. drop any stale <out>.old from a prior interrupted swap,
     #   2. move the current out_dir aside to <out>.old (if it exists),
-    #   3. os.replace(work_dir -> out_dir) — atomic rename, same fs,
+    #   3. os.replace(work_dir -> out_dir),
     #   4. best-effort remove <out>.old.
-    # All four steps are os.replace/rmtree on sibling paths in the same
-    # parent dir, so the rename is a true atomic filesystem operation
-    # (no cross-device copy). Idempotent and deterministic: re-running
-    # produces the same out_dir and leaves no .tmp/.old behind.
+    # Each rename is atomic, but the pair is not: readers can see a brief name
+    # gap. A failed second rename rolls the prior tree back into place.
     if os.path.isdir(old_dir):
         shutil.rmtree(old_dir)
-    if os.path.exists(out_dir):
-        os.replace(out_dir, old_dir)
-    os.replace(work_dir, out_dir)
+    moved_previous = False
+    try:
+        if os.path.exists(out_dir):
+            os.replace(out_dir, old_dir)
+            moved_previous = True
+        os.replace(work_dir, out_dir)
+    except Exception:
+        if moved_previous and not os.path.exists(out_dir) and os.path.exists(old_dir):
+            os.replace(old_dir, out_dir)
+        raise
     if os.path.isdir(old_dir):
         shutil.rmtree(old_dir, ignore_errors=True)
 
@@ -1919,20 +1978,20 @@ def _build_into(args, out_dir, work_dir):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(
-        prog="ongo-site",
+    p = OngoArgumentParser(
+        prog="ongo site build",
         description="Generate a static site from the kendb ongo-web "
         "publish set.",
     )
     p.add_argument(
         "--ken",
         default=None,
-        help="path to the ken binary (env KEN, else built-in default)",
+        help="path to Ken (then ONGO_KEN, plugin data, PATH)",
     )
     p.add_argument(
         "--db",
         default=None,
-        help="path to ken database (default: ~/.local/share/ken/ken.db)",
+        help="path to Ken database (then ONGO_KEN_DB, Ken default)",
     )
     p.add_argument(
         "--out",

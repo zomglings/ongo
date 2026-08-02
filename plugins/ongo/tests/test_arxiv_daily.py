@@ -1,35 +1,33 @@
 #!/usr/bin/env python3
-"""Unit tests for ongo-arxiv-daily.
+"""Unit tests for `ongo arxiv sweep`.
 
 Runs offline. Covers:
   * ``parse_arxiv_feed`` on an embedded Atom fixture (2 entries).
   * dedup filter treats ``2401.00001v2`` as duplicate of ``2401.00001``.
   * ``window_hours`` filter drops entries older than the window.
 
-The ``ongo-arxiv-daily`` script has no ``.py`` extension, so we load it via
-``importlib``. Its body is guarded by ``if __name__ == "__main__":`` so
-importing is side-effect-free.
+The command implementation is import-safe and tested without network access.
 """
 
-import importlib.machinery
-import importlib.util
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_SCRIPT = os.path.normpath(os.path.join(_HERE, "..", "bin", "ongo-arxiv-daily"))
+sys.path.insert(0, os.path.normpath(os.path.join(_HERE, "..", "lib")))
 
 
 def _load():
-    loader = importlib.machinery.SourceFileLoader("ongo_arxiv_daily", _SCRIPT)
-    spec = importlib.util.spec_from_loader("ongo_arxiv_daily", loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
+    from ongo import arxiv
+
+    return arxiv
 
 
 ATOM_FIXTURE = b"""<?xml version="1.0" encoding="UTF-8"?>
@@ -133,5 +131,41 @@ class WindowTests(unittest.TestCase):
         self.assertTrue(self.mod.within_window(recent, now, 24))
 
 
+@unittest.skipUnless(shutil.which("ken"), "Ken v3 is required")
+class KenPublishTests(unittest.TestCase):
+    def test_paper_graph_is_atomic_and_setup_supplies_related_to(self):
+        from ongo.ken import KenClient
+
+        with tempfile.TemporaryDirectory() as temporary:
+            database = str(Path(temporary) / "ken.db")
+            client = KenClient(binary=shutil.which("ken"), db=database)
+            client.initialize()
+            topic_id = client.command(
+                "add", "topic", "-k", "test", "--title", "Test"
+            ).stdout.strip()
+            entry = {
+                "id": "2401.99999",
+                "title": "Atomic paper",
+                "authors": ["Researcher"],
+                "primary_category": "cs.AI",
+                "published": "2026-08-01T00:00:00Z",
+                "summary": "Atomic abstract.",
+            }
+            command = [client.binary, "-D", database]
+            with self.assertRaises(subprocess.CalledProcessError):
+                _load().publish_paper(command, entry, "test", topic_id)
+            self.assertEqual(client.list_kind("arxiv"), [])
+            self.assertEqual(client.list_kind("note"), [])
+
+            client.ensure_kinds()
+            paper_id, note_id = _load().publish_paper(
+                command, entry, "test", topic_id
+            )
+            self.assertEqual(client.show(note_id)["body"].strip().splitlines()[-1], "Atomic abstract.")
+            relationships = client.show(paper_id)["relationships"]
+            self.assertEqual(
+                sum(item["relkind"] == "related-to" for item in relationships),
+                2,
+            )
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False).result.wasSuccessful() else 1)

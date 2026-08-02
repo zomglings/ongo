@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""ongo-delete — Delete publications and relationships from kendb.
+"""ongo ken delete — Delete publications and relationships from kendb.
 
 Ken (the knowledge database used by ongo) has no native delete command.
 This script provides delete functionality by operating directly on ken's
 SQLite database.
 
 Usage:
-    ongo-delete pub <id>              Delete a publication by ID (and its relationships/notes)
-    ongo-delete pub --key <key>       Delete publication(s) matching a key
-    ongo-delete pub --kind <kind>     Delete all publications of a given kind
-    ongo-delete rel <id>              Delete a single relationship by ID
-    ongo-delete --dry-run ...         Preview what would be deleted without deleting
+    ongo ken delete pub <id>              Delete a publication by ID (and its relationships/notes)
+    ongo ken delete pub --key <key>       Delete publication(s) matching a key
+    ongo ken delete pub --kind <kind>     Delete all publications of a given kind
+    ongo ken delete rel <id>              Delete a single relationship by ID
+    ongo ken delete --dry-run ...         Preview what would be deleted without deleting
 
 The database path defaults to ~/.local/share/ken/ken.db and respects
 XDG_DATA_HOME if set.
@@ -22,11 +22,35 @@ import sqlite3
 import sys
 import textwrap
 
+from .errors import OngoArgumentParser
+
 
 def get_db_path():
     """Return the ken database path, respecting XDG_DATA_HOME."""
+    configured = os.environ.get("ONGO_KEN_DB")
+    if configured:
+        return os.path.expanduser(configured)
+    try:
+        from .ken import resolve_db, resolve_ken
+
+        return resolve_db(resolve_ken())
+    except ImportError:
+        pass
     data_home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
     return os.path.join(data_home, "ken", "ken.db")
+
+
+def protect_experiment_publications(publications):
+    protected = [row for row in publications if row["kind"].startswith("ongo-experiment")]
+    if not protected:
+        return
+    print(
+        "error: experiment evidence is append-only and cannot be deleted with ongo",
+        file=sys.stderr,
+    )
+    for row in protected:
+        print(describe_pub(row), file=sys.stderr)
+    raise SystemExit(4)
 
 
 def connect(db_path):
@@ -127,6 +151,11 @@ def delete_publication(conn, pub_id, dry_run=False):
 
 def cmd_pub_by_id(conn, pub_id, dry_run=False):
     """Delete a single publication by its ID."""
+    row = conn.execute(
+        "SELECT id, key, kind, title FROM publications WHERE id = ?", (pub_id,)
+    ).fetchone()
+    if row:
+        protect_experiment_publications([row])
     prefix = "[dry run] " if dry_run else ""
     print(f"{prefix}Deleting publication {pub_id}:")
     count = delete_publication(conn, pub_id, dry_run=dry_run)
@@ -149,6 +178,7 @@ def cmd_pub_by_key(conn, key, dry_run=False):
     if not pubs:
         print(f"No publications found with key: {key}")
         return
+    protect_experiment_publications(pubs)
 
     prefix = "[dry run] " if dry_run else ""
     print(f"{prefix}Deleting {len(pubs)} publication(s) with key={key!r}:")
@@ -176,6 +206,7 @@ def cmd_pub_by_kind(conn, kind, dry_run=False):
     if not pubs:
         print(f"No publications found with kind: {kind}")
         return
+    protect_experiment_publications(pubs)
 
     prefix = "[dry run] " if dry_run else ""
     print(f"{prefix}Deleting {len(pubs)} publication(s) of kind={kind!r}:")
@@ -217,16 +248,16 @@ def cmd_rel_by_id(conn, rel_id, dry_run=False):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(
-        prog="ongo-delete",
+    parser = OngoArgumentParser(
+        prog="ongo ken delete",
         description="Delete publications and relationships from kendb.",
         epilog=textwrap.dedent("""\
             examples:
-              ongo-delete pub abc123                     Delete publication by ID
-              ongo-delete pub --key https://arxiv.org/x  Delete by key (URL, DOI, etc.)
-              ongo-delete pub --kind ongo-exploration     Delete all of a kind
-              ongo-delete rel def456                     Delete a relationship by ID
-              ongo-delete --dry-run pub --kind topic      Preview without deleting
+              ongo ken delete pub abc123                     Delete publication by ID
+              ongo ken delete pub --key https://arxiv.org/x  Delete by key (URL, DOI, etc.)
+              ongo ken delete pub --kind ongo-exploration     Delete all of a kind
+              ongo ken delete rel def456                     Delete a relationship by ID
+              ongo ken delete --dry-run pub --kind topic      Preview without deleting
         """),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -255,13 +286,13 @@ def build_parser():
     return parser
 
 
-def main():
+def main(argv=None):
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not args.entity:
         parser.print_help()
-        sys.exit(1)
+        return 2
 
     db_path = args.db or get_db_path()
     conn = connect(db_path)
@@ -276,11 +307,12 @@ def main():
                 cmd_pub_by_kind(conn, args.kind, dry_run=args.dry_run)
             else:
                 print("error: provide a publication ID, --key, or --kind", file=sys.stderr)
-                sys.exit(1)
+                return 2
         elif args.entity == "rel":
             cmd_rel_by_id(conn, args.id, dry_run=args.dry_run)
     finally:
         conn.close()
+    return 0
 
 
 if __name__ == "__main__":
