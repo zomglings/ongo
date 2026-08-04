@@ -2,10 +2,9 @@
 
 ## Setup
 
-ongo is a Claude Code skill plugin. The skill itself lives in
-`plugins/ongo/skills/ongo/` (`SKILL.md` plus the stdlib Python helpers in
-`bin/`). No build step or dependency install is required to work on it; a
-Python 3 interpreter is enough to run the checks below.
+Ongo is a Claude Code plugin. Its user-facing skill lives in
+`plugins/ongo/skills/ongo/`; the plugin-root `bin/ongo` entry point imports the
+stdlib-only runtime from `plugins/ongo/lib/ongo/`.
 
 ```bash
 git clone https://github.com/zomglings/ongo.git
@@ -17,10 +16,9 @@ cd ongo
 Before opening a PR, run all checks:
 
 ```bash
-python3 -m py_compile plugins/ongo/skills/ongo/bin/ongo-site
-python3 -m py_compile plugins/ongo/skills/ongo/bin/ongo-serve
-python3 -m py_compile plugins/ongo/skills/ongo/bin/ongo-poll
-python3 -m py_compile plugins/ongo/skills/ongo/bin/ongo-delete
+python3 -m py_compile plugins/ongo/bin/ongo plugins/ongo/lib/ongo/*.py
+python3 -m unittest discover -s plugins/ongo/tests -p 'test_*.py' -v
+claude plugin validate --strict plugins/ongo
 ```
 
 If you change `SKILL.md`, re-read it start to finish for internal
@@ -29,16 +27,10 @@ static-site sections must not contradict each other).
 
 ## Version bumps
 
-Every PR must bump the `version:` field in
-`plugins/ongo/skills/ongo/SKILL.md` (the YAML frontmatter at the top,
-alongside `name: ongo`) **unless the PR ONLY touches documentation** —
-top-level `*.md` files, the `docs/` directory, or `.github/`. If your
-change touches the skill instructions, the `bin/` helpers, or any
-configuration, bump the version.
-
-`SKILL.md`'s `version:` frontmatter field is the **single source of truth**
-for the skill version. A CI check (`.github/workflows/version-bump-check.yml`)
-enforces this on every pull request to `main`.
+Every non-documentation PR must bump `plugins/ongo/.claude-plugin/plugin.json`
+and keep `.claude-plugin/marketplace.json` synchronized. The plugin manifest is
+the release-version source of truth; `SKILL.md` intentionally has no private
+version field.
 
 ## Pull requests
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for ongo-site's date-time sort ordering.
+"""Unit tests for `ongo site build` date-time sort ordering.
 
 Verifies:
   * `_invert_date` is monotone-descending across full timestamps.
@@ -9,30 +9,22 @@ Verifies:
     `created_at` is missing) inverse-sorts to the BOTTOM of the
     newest-first list, so missing rows always appear last.
 
-The ongo-site script has no `.py` extension, so we load it as a module via
-``importlib.util``.
+The command implementation is imported as a normal plugin module.
 """
 
-import importlib.util
-import importlib.machinery
 import os
 import sys
 import unittest
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_SITE_SCRIPT = os.path.normpath(os.path.join(_HERE, "..", "bin", "ongo-site"))
+sys.path.insert(0, os.path.normpath(os.path.join(_HERE, "..", "lib")))
 
 
 def _load():
-    # ongo-site has no .py extension, so we need an explicit SourceFileLoader.
-    loader = importlib.machinery.SourceFileLoader("ongo_site", _SITE_SCRIPT)
-    spec = importlib.util.spec_from_loader("ongo_site", loader)
-    mod = importlib.util.module_from_spec(spec)
-    # The script's top level is import-safe (all execution is guarded by
-    # ``if __name__ == "__main__":``).
-    loader.exec_module(mod)
-    return mod
+    from ongo import site
+
+    return site
 
 
 class SortByDateTimeTests(unittest.TestCase):

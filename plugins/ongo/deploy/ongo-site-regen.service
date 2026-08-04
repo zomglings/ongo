@@ -3,7 +3,7 @@
 #   sudo cp ongo-site-regen.service ongo-site-regen.timer /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now ongo-site-regen.timer
-# Atomic-swap publish: the running ongo-site.service keeps serving; no restart.
+# Staged replacement: the running ongo-site.service needs no restart.
 
 [Unit]
 Description=Regenerate ongo-site from kendb (oneshot)
@@ -14,8 +14,9 @@ Type=oneshot
 # Replace with the user that owns the site directory.
 User=ongo
 Group=ongo
-# Adjust to where the ongo plugin is installed on this host.
-WorkingDirectory=/opt/ongo/skills/ongo
-ExecStart=/usr/bin/python3 /opt/ongo/skills/ongo/bin/ongo-site
+# /opt/ongo is a stable copy of one plugin release, not Claude's cache path.
+WorkingDirectory=/opt/ongo
+Environment=ONGO_DATA_DIR=/var/lib/ongo
+ExecStart=/opt/ongo/bin/ongo site build --out /opt/ongo/site
 TimeoutStartSec=600
 Nice=10

@@ -40,25 +40,28 @@ jobs:
           exit 0
         fi
 
-        # Compare the SKILL.md frontmatter `version:` on main vs this PR.
-        # The field may not exist yet on main (this PR may be the one
-        # introducing it): treat a missing main version as empty so any
-        # PR that adds the field counts as a bump.
-        skill=plugins/ongo/skills/ongo/SKILL.md
-        main_version=$(git show origin/main:$skill 2>/dev/null \
-          | sed -n 's/^version: *//p' | head -1)
-        pr_version=$(sed -n 's/^version: *//p' "$skill" | head -1)
+        manifest=plugins/ongo/.claude-plugin/plugin.json
+        marketplace=.claude-plugin/marketplace.json
+        main_version=$(git show origin/main:$manifest 2>/dev/null \
+          | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+        pr_version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$manifest")
+        marketplace_version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["plugins"][0]["version"])' "$marketplace")
 
         echo "main version: '$main_version'"
         echo "PR version:   '$pr_version'"
 
         if [ -z "$pr_version" ]; then
-          echo "::error::No 'version:' field found in $skill frontmatter. Add one and bump it for non-docs changes."
+          echo "::error::No version found in $manifest."
           exit 1
         fi
 
         if [ "$main_version" = "$pr_version" ]; then
-          echo "::error::Version in $skill was not bumped. Please bump the 'version:' frontmatter field for non-docs changes."
+          echo "::error::Version in $manifest was not bumped."
+          exit 1
+        fi
+
+        if [ "$pr_version" != "$marketplace_version" ]; then
+          echo "::error::Plugin manifest and marketplace versions differ."
           exit 1
         fi
 

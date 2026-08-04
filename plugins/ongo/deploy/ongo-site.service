@@ -22,9 +22,9 @@ Type=simple
 # Replace with the unprivileged user that owns the site directory.
 User=ongo
 Group=ongo
-# Absolute path to the ongo skill's bin/ongo-serve and the generated site.
-# Adjust to where the ongo plugin is installed on this host.
-ExecStart=/usr/bin/python3 /opt/ongo/skills/ongo/bin/ongo-serve \
+# Use a stable plugin release; Claude's versioned cache is not a service path.
+Environment=ONGO_DATA_DIR=/var/lib/ongo
+ExecStart=/opt/ongo/bin/ongo site serve \
     --dir /opt/ongo/site --host 0.0.0.0 --port 80
 WorkingDirectory=/opt/ongo
 Restart=on-failure

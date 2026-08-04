@@ -7,8 +7,8 @@
     {
       "name": "ongo",
       "source": "./plugins/ongo",
-      "version": "0.1.0",
-      "description": "Autonomous ongoing research agent — reads requests from Slack, tracks research in kendb, self-improves"
+      "version": "0.4.0",
+      "description": "Claude Code research skill with deterministic experiment management backed by Ken"
     }
   ]
 }
