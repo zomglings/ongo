@@ -1,8 +1,10 @@
 ---
 name: ongo
 description: >-
-  Autonomous research agent. Polls Slack for research requests, tracks findings
-  in kendb, expands research when idle, and self-improves on a 24-hour cycle.
+  Research agent and deterministic experiment-management toolkit. Use for
+  planning, approving, executing, or verifying experiments through the Ongo
+  CLI; also polls Slack, tracks findings in Ken, expands research when idle,
+  and self-improves on a 24-hour cycle.
 args: "[--channel <channel_id>] [--interval <minutes>] [--idle]"
 ---
 
