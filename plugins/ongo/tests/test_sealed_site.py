@@ -389,6 +389,144 @@ class ProtectedSiteTests(unittest.TestCase):
         self.assertIsNotNone(artifact_for_artifact)
         self.assertIn("ARTIFACT_SECRET_BODY", artifact_for_artifact["html"])
 
+    def test_experiment_notes_and_topics_follow_experiment_encryption(self):
+        experiment_id = self.add_experiment()
+        topic_id = self.client.command(
+            "add",
+            "topic",
+            "--key",
+            "protected-deviation",
+            "--title",
+            "EXPERIMENT_NOTE_SECRET_TOPIC",
+        ).stdout.strip()
+        noted = experiments.add_experiment_note(
+            self.client,
+            experiment_id,
+            actor="WORKER_SECRET_LABEL",
+            markdown="# EXPERIMENT_NOTE_SECRET_BODY\n\nLorem ipsum deviation.",
+            topic_identifiers=[topic_id],
+        )
+        note_id = noted["note"]["record_id"]
+        self.client.command(
+            "add",
+            "ongo-web",
+            "--key",
+            note_id,
+            "--title",
+            "EXPERIMENT_NOTE_STANDALONE_SECRET",
+        )
+        key = create_key(
+            self.client,
+            label="Experiment note readers",
+            scope="empty",
+            keyring_path=self.keyring,
+        )
+        for publication_id in (experiment_id, note_id, topic_id):
+            grant_key(self.client, key["key_id"], publication_id)
+
+        output = self.root / "experiment-notes-site"
+        logs = io.StringIO()
+        with mock.patch.object(
+            site, "vendor_katex", return_value=False
+        ), contextlib.redirect_stdout(logs):
+            self.assertEqual(site.build(self.args(output)), 0)
+
+        output_bytes = b"\n".join(
+            path.read_bytes() for path in output.rglob("*") if path.is_file()
+        )
+        for sentinel in (
+            "EXPERIMENT_NOTE_SECRET_TOPIC",
+            "EXPERIMENT_NOTE_SECRET_BODY",
+            "WORKER_SECRET_LABEL",
+            "EXPERIMENT_NOTE_STANDALONE_SECRET",
+        ):
+            self.assertNotIn(sentinel.encode(), output_bytes)
+        manifest = json.loads((output / "assets" / "ongo-sealed.json").read_text())
+        self.assertEqual(len(manifest["resources"]), 1)
+        envelope = json.loads(
+            (output / manifest["resources"][0]["envelope"]).read_text()
+        )
+        payload = self.decrypt(envelope, key["key_id"])
+        self.assertIn("EXPERIMENT_NOTE_SECRET_BODY", payload["html"])
+        self.assertIn("EXPERIMENT_NOTE_SECRET_TOPIC", payload["html"])
+        self.assertIn("WORKER_SECRET_LABEL", payload["html"])
+        self.assertIn("only publishable inside its experiment", logs.getvalue())
+
+    def test_public_experiment_cannot_copy_a_protected_experiment_note(self):
+        experiment_id = self.add_experiment()
+        note_id = experiments.add_experiment_note(
+            self.client,
+            experiment_id,
+            actor="worker",
+            markdown="EXPERIMENT_NOTE_PROJECTION_SECRET",
+        )["note"]["record_id"]
+        key = create_key(
+            self.client,
+            label="Note-only readers",
+            scope="empty",
+            keyring_path=self.keyring,
+        )
+        grant_key(self.client, key["key_id"], note_id)
+        output = self.root / "experiment-note-policy-conflict"
+        output.mkdir()
+        (output / "sentinel.txt").write_text("previous site", encoding="utf-8")
+
+        with self.assertRaises(OngoError) as raised:
+            site.build(self.args(output))
+
+        self.assertEqual(raised.exception.code, "derived-access-policy-conflict")
+        self.assertEqual((output / "sentinel.txt").read_text(), "previous site")
+        self.assertNotIn(
+            "EXPERIMENT_NOTE_PROJECTION_SECRET",
+            "\n".join(
+                path.read_text(encoding="utf-8", errors="ignore")
+                for path in output.rglob("*")
+                if path.is_file()
+            ),
+        )
+
+    def test_public_experiment_cannot_copy_a_protected_note_topic(self):
+        experiment_id = self.add_experiment()
+        topic_id = self.client.command(
+            "add",
+            "topic",
+            "--key",
+            "restricted-topic",
+            "--title",
+            "EXPERIMENT_TOPIC_PROJECTION_SECRET",
+        ).stdout.strip()
+        experiments.add_experiment_note(
+            self.client,
+            experiment_id,
+            actor="worker",
+            markdown="Public note with a restricted topic label.",
+            topic_identifiers=[topic_id],
+        )
+        key = create_key(
+            self.client,
+            label="Topic-only readers",
+            scope="empty",
+            keyring_path=self.keyring,
+        )
+        grant_key(self.client, key["key_id"], topic_id)
+        output = self.root / "experiment-topic-policy-conflict"
+        output.mkdir()
+        (output / "sentinel.txt").write_text("previous site", encoding="utf-8")
+
+        with self.assertRaises(OngoError) as raised:
+            site.build(self.args(output))
+
+        self.assertEqual(raised.exception.code, "derived-access-policy-conflict")
+        self.assertEqual((output / "sentinel.txt").read_text(), "previous site")
+        self.assertNotIn(
+            "EXPERIMENT_TOPIC_PROJECTION_SECRET",
+            "\n".join(
+                path.read_text(encoding="utf-8", errors="ignore")
+                for path in output.rglob("*")
+                if path.is_file()
+            ),
+        )
+
     def test_missing_assigned_key_fails_without_replacing_previous_site(self):
         publication = self.add_note(
             "assigned", "ASSIGNED_SECRET", "# ASSIGNED_BODY"

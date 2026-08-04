@@ -23,6 +23,7 @@ sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
 from ongo.errors import OngoError
 from ongo import site
 from ongo.experiments import (
+    add_experiment_note,
     approve_experiment,
     artifact_envelope,
     begin_experiment,
@@ -31,6 +32,9 @@ from ongo.experiments import (
     create_experiment,
     current_spend,
     finish_attempt,
+    experiment_notes,
+    experiment_notes_markdown,
+    experiment_view,
     markdown_view,
     read_artifact_specs,
     retry_condition,
@@ -859,6 +863,176 @@ class ExperimentIntegrationTests(unittest.TestCase):
         stored = json.loads(self.client.records("ongo-experiment-artifact")[0]["body"])
         self.assertEqual(stored["encoding"], "utf-8")
         self.assertEqual(stored["content"], "café")
+
+    def test_experiment_notes_are_append_only_idempotent_and_documentary(self):
+        created = self.create([self.manual_condition()], title="Noted protocol")
+        experiment_id = created["experiment"]["experiment_id"]
+        topic_id = self.client.command(
+            "add", "topic", "--key", "protocol-deviation", "--title", "Protocol deviation"
+        ).stdout.strip()
+        baseline = state_for_experiment(self.client, experiment_id)
+
+        first = add_experiment_note(
+            self.client,
+            experiment_id,
+            actor="driver",
+            markdown="The setup required **manual calibration**.",
+            topic_identifiers=["protocol-deviation"],
+            operation_key="setup-observation",
+        )
+        repeated = add_experiment_note(
+            self.client,
+            experiment_id,
+            actor="driver",
+            markdown="The setup required **manual calibration**.",
+            topic_identifiers=[topic_id],
+            operation_key="setup-observation",
+        )
+        self.assertFalse(first["idempotent"])
+        self.assertTrue(repeated["idempotent"])
+        self.assertEqual(first["note"]["record_id"], repeated["note"]["record_id"])
+        with self.assertRaises(OngoError) as changed:
+            add_experiment_note(
+                self.client,
+                experiment_id,
+                actor="driver",
+                markdown="Changed content",
+                topic_identifiers=[topic_id],
+                operation_key="setup-observation",
+            )
+        self.assertEqual(changed.exception.exit_code, 4)
+
+        after_root_note = state_for_experiment(self.client, experiment_id)
+        for field in (
+            "approved",
+            "plan_frozen",
+            "planned_runs",
+            "valid_runs",
+            "remaining_runs",
+            "open_attempts",
+            "complete",
+            "expected_cost_usd",
+        ):
+            self.assertEqual(after_root_note[field], baseline[field], field)
+        self.assertEqual(after_root_note["note_count"], 1)
+        self.assertEqual(after_root_note["note_counts"]["experiment"], 1)
+
+        self.approve_free(experiment_id)
+        attempt = begin_experiment(self.client, experiment_id, "worker")["attempt"]
+        open_status = state_for_experiment(self.client, experiment_id)
+        add_experiment_note(
+            self.client,
+            experiment_id,
+            actor="worker",
+            markdown="Condition fixture was difficult to align.",
+            condition_id="manual",
+        )
+        add_experiment_note(
+            self.client,
+            experiment_id,
+            actor="worker",
+            markdown="This attempt deviated by 3 ms from the target window.",
+            attempt_identifier=attempt["attempt_id"],
+        )
+        noted_open_status = state_for_experiment(self.client, experiment_id)
+        for field in ("approved", "plan_frozen", "valid_runs", "remaining_runs", "open_attempts", "complete"):
+            self.assertEqual(noted_open_status[field], open_status[field], field)
+
+        result = {
+            "schema_version": 1,
+            "status": "completed",
+            "valid_observation": True,
+            "summary": "observed",
+            "metrics": {},
+            "actual_cost_usd": "0",
+        }
+        finish_attempt(
+            self.client,
+            attempt["attempt_id"],
+            result,
+            {
+                "observation": artifact_envelope(
+                    "observation", "observation.txt", "text/plain", b"ok"
+                )
+            },
+        )
+        verified_before, code_before = verify_experiment(self.client, experiment_id)
+        add_experiment_note(
+            self.client,
+            experiment_id,
+            actor="driver",
+            markdown="Post-run interpretation remains tentative.",
+        )
+        verified_after, code_after = verify_experiment(self.client, experiment_id)
+        self.assertEqual((code_before, code_after), (0, 0))
+        for field in ("valid_runs", "remaining_runs", "open_attempts", "complete"):
+            self.assertEqual(verified_after[field], verified_before[field], field)
+
+        notes = experiment_notes(self.client, experiment_id)
+        self.assertEqual(len(notes), 4)
+        self.assertEqual(
+            {note["target_type"] for note in notes},
+            {"experiment", "condition", "attempt"},
+        )
+        self.assertEqual(notes[0]["topics"][0]["record_id"], topic_id)
+        self.assertIn("manual calibration", experiment_notes_markdown(self.client, experiment_id))
+        view = experiment_view(self.client, experiment_id)
+        self.assertEqual(len(view["notes"]), 4)
+        self.assertIn("attempt deviated", markdown_view(self.client, experiment_id))
+
+    def test_experiment_note_rejects_foreign_targets_and_ambiguous_topics(self):
+        first = self.create([self.manual_condition("first")], title="First")
+        second = self.create([self.manual_condition("second")], title="Second")
+        first_id = first["experiment"]["experiment_id"]
+        second_id = second["experiment"]["experiment_id"]
+        self.approve_free(first_id)
+        attempt = begin_experiment(self.client, first_id, "worker")["attempt"]
+
+        with self.assertRaises(OngoError) as foreign:
+            add_experiment_note(
+                self.client,
+                second_id,
+                actor="worker",
+                markdown="Foreign attempt",
+                attempt_identifier=attempt["attempt_id"],
+            )
+        self.assertEqual(foreign.exception.exit_code, 2)
+        self.assertEqual(experiment_notes(self.client, second_id), [])
+
+        first_topic = self.client.command(
+            "add", "topic", "--key", "first-topic", "--title", "First topic"
+        ).stdout.strip()
+        self.client.command(
+            "add", "topic", "--key", first_topic, "--title", "Ambiguous topic"
+        )
+        with self.assertRaises(OngoError) as ambiguous:
+            add_experiment_note(
+                self.client,
+                second_id,
+                actor="driver",
+                markdown="Ambiguous tagging",
+                topic_identifiers=[first_topic],
+            )
+        self.assertEqual(ambiguous.exception.exit_code, 4)
+        self.assertEqual(experiment_notes(self.client, second_id), [])
+
+    def test_experiment_note_ingestion_failure_leaves_no_partial_record(self):
+        created = self.create([self.manual_condition()])
+        experiment_id = created["experiment"]["experiment_id"]
+        with mock.patch.object(
+            self.client,
+            "load",
+            side_effect=OngoError("simulated Ken rejection", code="ken-command-failed", exit_code=3),
+        ):
+            with self.assertRaises(OngoError):
+                add_experiment_note(
+                    self.client,
+                    experiment_id,
+                    actor="driver",
+                    markdown="This transaction must not partially persist.",
+                )
+        self.assertEqual(self.client.list_kind("ongo-experiment-note"), [])
+        self.assertEqual(experiment_notes(self.client, experiment_id), [])
 
     def test_experiment_is_private_until_explicit_web_marker(self):
         created = self.create([self.manual_condition()])

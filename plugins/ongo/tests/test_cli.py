@@ -47,6 +47,9 @@ class CliTests(unittest.TestCase):
             ("experiment", "show"),
             ("experiment", "render"),
             ("experiment", "status"),
+            ("experiment", "note"),
+            ("experiment", "note", "add"),
+            ("experiment", "note", "list"),
             ("experiment", "delegate", "create"),
             ("experiment", "approve"),
             ("experiment", "begin"),
@@ -134,6 +137,72 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(approved.returncode, 0, approved.stderr)
             self.assertEqual(json.loads(approved.stdout)["approval"]["authority"], "zero-cost-policy")
+
+            topic_id = subprocess.run(
+                [
+                    "ken",
+                    "-D",
+                    str(database),
+                    "add",
+                    "topic",
+                    "--key",
+                    "cli-deviation",
+                    "--title",
+                    "CLI deviation",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            noted = subprocess.run(
+                [
+                    str(ONGO),
+                    "experiment",
+                    "note",
+                    "add",
+                    experiment_id,
+                    "--actor",
+                    "driver",
+                    "--text",
+                    "A free-form **CLI note**.",
+                    "--topic",
+                    "cli-deviation",
+                    "--operation-key",
+                    "cli-note",
+                ],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(noted.returncode, 0, noted.stderr)
+            note_payload = json.loads(noted.stdout)
+            note_id = note_payload["note"]["record_id"]
+            self.assertEqual(note_payload["note"]["topics"][0]["record_id"], topic_id)
+            listed = subprocess.run(
+                [
+                    str(ONGO),
+                    "experiment",
+                    "note",
+                    "list",
+                    experiment_id,
+                    "--format",
+                    "markdown",
+                ],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            self.assertIn("free-form **CLI note**", listed.stdout)
+
+            guarded_note = subprocess.run(
+                [str(ONGO), "ken", "delete", "pub", note_id],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(guarded_note.returncode, 4)
+            self.assertFalse(json.loads(guarded_note.stderr)["ok"])
 
             guarded = subprocess.run(
                 [

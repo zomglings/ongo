@@ -401,11 +401,20 @@ def resolve_source(view, pub, log, ken, db_path):
     # condition matrix rather than exposing the root publication's JSON.
     if pub["kind"] == "ongo-experiment":
         try:
-            from .experiments import markdown_view
+            from .experiments import experiment_notes, markdown_view
             from .ken import KenClient
 
             client = KenClient(binary=ken, db=db_path)
-            return {"kind": "markdown", "body": markdown_view(client, pub["id"])}
+            notes = experiment_notes(client, pub["id"])
+            source_ids = []
+            for note in notes:
+                source_ids.append(note["record_id"])
+                source_ids.extend(topic["record_id"] for topic in note["topics"])
+            return {
+                "kind": "markdown",
+                "body": markdown_view(client, pub["id"]),
+                "content_source_ids": list(dict.fromkeys(source_ids)),
+            }
         except Exception as error:
             log.append(
                 f"  WARNING: could not render experiment {pub['id']}: {error}"
@@ -1830,6 +1839,13 @@ def _build_into(args, out_dir, work_dir, old_dir):
                 "metadata, which is never publishable — skipping"
             )
             continue
+        if pub["kind"] == "ongo-experiment-note":
+            log.append(
+                f"  WARNING: ongo-web {m['id']} points at an experiment "
+                "note, which is only publishable inside its experiment — "
+                "skipping"
+            )
+            continue
         if pub["id"] in items:
             log.append(
                 f"  WARNING: multiple ongo-web markers reference {pub['id']} — "
@@ -1870,6 +1886,7 @@ def _build_into(args, out_dir, work_dir, old_dir):
             "page_path": f"items/{slug}.html",
             "list_rank": pub.get("list_rank", len(view.rows)),
             "is_experiment": pub["kind"] == "ongo-experiment",
+            "content_source_ids": source.get("content_source_ids", []),
         }
 
     # ongo-digest publications are a first-class site view — surfaced on

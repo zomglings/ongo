@@ -48,7 +48,15 @@ Ongo runs as a durable scheduled loop managed by Claude Code:
 
 All research is tracked in kendb with publications, relationships, and notes.
 Experiment plans, approvals, attempts, results, and artifacts are append-only
-Ken publications managed exclusively through `ongo experiment`.
+Ken publications managed exclusively through `ongo experiment`. Free-form
+Markdown notes document protocol difficulties and deviations without changing
+the protocol or verification state:
+
+```bash
+ongo experiment note add <experiment-id> --actor <label> --file deviation.md \
+  --attempt <attempt-id> --topic <existing-topic-key> --operation-key <key>
+ongo experiment note list <experiment-id> --format markdown
+```
 
 ### Static publishing and access keys
 
@@ -87,6 +95,10 @@ Digest bodies are derived from related note publications. If a source note is
 protected, the digest must be granted a non-broader subset of those keys; the
 builder rejects an incompatible public or more widely shared digest instead of
 copying protected source text into it.
+Experiment notes are similarly derived into their experiment page. The builder
+encrypts note bodies, actors, and topic labels with the experiment and rejects
+access rules that would expose a protected note or topic through a broader
+experiment resource. An experiment note cannot be published independently.
 
 The administrator keyring defaults to the plugin data directory and is written
 with mode `0600`; Ken contains only descriptors and access relationships.
