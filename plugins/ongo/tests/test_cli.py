@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import json
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -116,7 +117,9 @@ class CliTests(unittest.TestCase):
                 env=environment,
             )
             self.assertEqual(created.returncode, 0, created.stderr)
-            experiment_id = json.loads(created.stdout)["experiment"]["experiment_id"]
+            created_payload = json.loads(created.stdout)
+            experiment_id = created_payload["experiment"]["experiment_id"]
+            experiment_record_id = created_payload["record_id"]
             approved = subprocess.run(
                 [str(ONGO), "experiment", "approve", experiment_id, "--actor", "driver"],
                 capture_output=True,
@@ -155,6 +158,121 @@ class CliTests(unittest.TestCase):
                 ),
                 1,
             )
+
+            with sqlite3.connect(database) as connection:
+                experiment_relationship_id = connection.execute(
+                    "SELECT id FROM relationships WHERE kind = 'ongo-has-plan'"
+                ).fetchone()[0]
+            for dry_run in (True, False):
+                arguments = ["ken", "delete"]
+                if dry_run:
+                    arguments.append("--dry-run")
+                arguments.extend(("rel", experiment_relationship_id))
+                guarded_relationship = subprocess.run(
+                    [str(ONGO), *arguments],
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                )
+                self.assertEqual(guarded_relationship.returncode, 4)
+                self.assertFalse(json.loads(guarded_relationship.stderr)["ok"])
+            with sqlite3.connect(database) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT count(*) FROM relationships WHERE id = ?",
+                        (experiment_relationship_id,),
+                    ).fetchone()[0],
+                    1,
+                )
+
+            first_note = subprocess.run(
+                ["ken", "-D", str(database), "add", "note", "--title", "First"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            second_note = subprocess.run(
+                ["ken", "-D", str(database), "add", "note", "--title", "Second"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            experiment_evidence_relationship = subprocess.run(
+                [
+                    "ken",
+                    "-D",
+                    str(database),
+                    "relate",
+                    "--subject",
+                    first_note,
+                    "--object",
+                    experiment_record_id,
+                    "--relation",
+                    "related-to",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            for arguments in (
+                ("pub", first_note),
+                ("pub", "--kind", "note"),
+            ):
+                guarded_publication = subprocess.run(
+                    [str(ONGO), "ken", "delete", *arguments],
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                )
+                self.assertEqual(guarded_publication.returncode, 4)
+                self.assertFalse(json.loads(guarded_publication.stderr)["ok"])
+            with sqlite3.connect(database) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT count(*) FROM publications WHERE id IN (?, ?)",
+                        (first_note, second_note),
+                    ).fetchone()[0],
+                    2,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT count(*) FROM relationships WHERE id = ?",
+                        (experiment_evidence_relationship,),
+                    ).fetchone()[0],
+                    1,
+                )
+            ordinary_relationship = subprocess.run(
+                [
+                    "ken",
+                    "-D",
+                    str(database),
+                    "relate",
+                    "--subject",
+                    first_note,
+                    "--object",
+                    second_note,
+                    "--relation",
+                    "related-to",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            deleted_relationship = subprocess.run(
+                [str(ONGO), "ken", "delete", "rel", ordinary_relationship],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(deleted_relationship.returncode, 0, deleted_relationship.stderr)
+            with sqlite3.connect(database) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT count(*) FROM relationships WHERE id = ?",
+                        (ordinary_relationship,),
+                    ).fetchone()[0],
+                    0,
+                )
 
 
 if __name__ == "__main__":

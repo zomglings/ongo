@@ -180,6 +180,42 @@ class ExperimentIntegrationTests(unittest.TestCase):
         self.assertEqual(raised.exception.exit_code, 2)
         self.assertEqual(len(self.client.list_kind("ongo-experiment")), before)
 
+    def test_non_finite_json_numbers_are_rejected_before_creation(self):
+        condition = {
+            "id": "local",
+            "description": "Must never begin",
+            "required_runs": 1,
+            "expected_cost_usd": "0",
+            "required_artifacts": ["stdout", "stderr"],
+            "execution": {
+                "mode": "local",
+                "argv": [sys.executable, "-c", "print('should not run')"],
+                "cwd": str(self.root),
+                "env": {},
+                "timeout_seconds": 7,
+                "accepted_exit_codes": [0],
+                "output_files": [],
+            },
+        }
+        document, manifest = self.write_plan([condition])
+        base = manifest.read_text(encoding="utf-8")
+        for literal in (
+            "1e999",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            "1" + ("0" * 400),
+        ):
+            with self.subTest(literal=literal):
+                manifest.write_text(
+                    base.replace('"timeout_seconds": 7', f'"timeout_seconds": {literal}'),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(OngoError) as raised:
+                    create_experiment(self.client, str(document), str(manifest))
+                self.assertEqual(raised.exception.exit_code, 2)
+                self.assertEqual(self.client.list_kind("ongo-experiment"), [])
+
     def test_changed_protocol_is_a_successor_and_does_not_reuse_approval(self):
         first = self.create([self.manual_condition()], "First")
         first_id = first["experiment"]["experiment_id"]
@@ -423,6 +459,41 @@ class ExperimentIntegrationTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.exit_code, 5)
 
+    def test_cancelled_attempt_retains_expected_budget_reservation(self):
+        created = self.create([self.manual_condition(cost="1")], "Cancelled spend")
+        experiment_id = created["experiment"]["experiment_id"]
+        delegation = self.delegation(max_per="1.5", max_total="1.5")
+        approved = approve_experiment(
+            self.client,
+            experiment_id,
+            delegation["delegation_id"],
+            "driver",
+            "driver",
+        )
+        attempt = begin_experiment(self.client, experiment_id, "worker")
+        cancelled = cancel_attempt(
+            self.client,
+            attempt["attempt"]["attempt_id"],
+            "interrupted after paid work",
+        )
+        self.assertIsNone(cancelled["result"]["actual_cost_usd"])
+        self.assertEqual(current_spend(self.client, experiment_id), Decimal("1"))
+        repeated = approve_experiment(
+            self.client,
+            experiment_id,
+            delegation["delegation_id"],
+            "driver",
+            "driver",
+        )
+        self.assertTrue(repeated["idempotent"])
+        self.assertEqual(
+            repeated["approval"]["approval_id"],
+            approved["approval"]["approval_id"],
+        )
+        with self.assertRaises(OngoError) as raised:
+            retry_condition(self.client, experiment_id, "manual", "worker")
+        self.assertEqual(raised.exception.exit_code, 5)
+
     def test_approver_and_worker_labels_are_separated(self):
         created = self.create([self.manual_condition()])
         experiment_id = created["experiment"]["experiment_id"]
@@ -607,6 +678,22 @@ class ExperimentIntegrationTests(unittest.TestCase):
                 },
             },
             {
+                "id": "invalid-launch",
+                "description": "Unexpected subprocess setup errors become results",
+                "required_runs": 1,
+                "expected_cost_usd": "0",
+                "required_artifacts": ["stdout", "stderr"],
+                "execution": {
+                    "mode": "local",
+                    "argv": [f"{sys.executable}\0"],
+                    "cwd": str(self.root),
+                    "env": {},
+                    "timeout_seconds": 1,
+                    "accepted_exit_codes": [0],
+                    "output_files": [],
+                },
+            },
+            {
                 "id": "untouched",
                 "description": "Still runs after both failures",
                 "required_runs": 1,
@@ -629,8 +716,9 @@ class ExperimentIntegrationTests(unittest.TestCase):
         status, exit_code = run_local(self.client, experiment_id)
         self.assertEqual(exit_code, 6)
         self.assertFalse(sentinel.exists())
-        self.assertEqual(status["failed_attempts"], 2)
-        self.assertEqual(status["conditions"][2]["valid_runs"], 1)
+        self.assertEqual(status["failed_attempts"], 3)
+        self.assertEqual(status["open_attempts"], 0)
+        self.assertEqual(status["conditions"][3]["valid_runs"], 1)
 
     def test_local_runner_records_missing_outputs_and_continues(self):
         marker = self.root / "continued.txt"

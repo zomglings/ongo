@@ -8,6 +8,8 @@ import io
 import json
 import os
 import shutil
+import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -107,6 +109,21 @@ class SetupAndSiteTests(unittest.TestCase):
             verify_checksum(candidate, "0" * 64)
         self.assertEqual(raised.exception.code, "ken-checksum-mismatch")
 
+    def test_doctor_requires_cursor_capable_clacks(self):
+        for version, expected in (("0.14.0", False), ("0.14.1", True)):
+            with self.subTest(version=version), mock.patch.object(
+                cli.shutil, "which", return_value="/test/clacks"
+            ), mock.patch.object(
+                cli.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout=version, stderr=""
+                ),
+            ):
+                report = cli.clacks_version()
+            self.assertEqual(report["ok"], expected)
+            self.assertEqual(report["minimum"], "0.14.1")
+
     def test_site_is_private_by_default_and_uses_explicit_markers(self):
         client = KenClient(binary=str(self.data / "bin" / "ken"), db=str(self.database))
         client.initialize()
@@ -152,6 +169,42 @@ class SetupAndSiteTests(unittest.TestCase):
         self.assertEqual(
             len(list((self.root / "site" / "items").glob("*.html"))), 2
         )
+
+    def test_site_preserves_ken_creation_dates_and_order(self):
+        client = KenClient(binary=str(self.data / "bin" / "ken"), db=str(self.database))
+        client.initialize()
+        client.ensure_kinds()
+        publications = []
+        for title, timestamp in (
+            ("Older evidence", "2026-07-01 09:00:00"),
+            ("Newer evidence", "2026-07-02 14:30:00"),
+        ):
+            source = self.root / f"{title.lower().replace(' ', '-')}.md"
+            source.write_text(f"# {title}\n", encoding="utf-8")
+            publication_id = client.command(
+                "add", "note", "-k", str(source), "--title", title
+            ).stdout.strip()
+            client.command("add", "ongo-web", "-k", publication_id, "--title", title)
+            publications.append((publication_id, timestamp))
+        with sqlite3.connect(self.database) as connection:
+            connection.executemany(
+                "UPDATE publications SET created_at = ? WHERE id = ?",
+                [(timestamp, publication_id) for publication_id, timestamp in publications],
+            )
+
+        class Args:
+            ken = str(self.data / "bin" / "ken")
+            db = str(self.database)
+            out = str(self.root / "dated-site")
+            site_title = "Dated site"
+            base_url = ""
+
+        with mock.patch.object(site, "vendor_katex", return_value=False), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(site.build(Args), 0)
+        index = (self.root / "dated-site" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("2026-07-01 09:00:00", index)
+        self.assertIn("2026-07-02 14:30:00", index)
+        self.assertLess(index.index("Newer evidence"), index.index("Older evidence"))
 
 
 if __name__ == "__main__":

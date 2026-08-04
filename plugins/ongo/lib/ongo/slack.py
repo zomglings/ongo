@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""`ongo slack poll` — robust Slack poll for the Ongo tick loop.
+"""`ongo slack poll` — gap-free Slack poll for the Ongo tick loop.
 
 Usage:
     ongo slack poll <CHANNEL> <LAST_USER_TS>
@@ -10,23 +10,10 @@ Prints JSON. On success:
 On read failure (rate limit / API error / unparseable):
     {"status":"error","error":"<msg>","user_count":0,
      "newest_user_ts":"<LAST_USER_TS unchanged>","user_messages":[]}
-On a saturated window (>= LIM messages since LAST_USER_TS, so Slack
-silently dropped the OLDEST ones — see bug 4 below):
-    {"status":"truncated","total_seen":LIM,"user_count":N,
-     "newest_user_ts":"<safe re-poll anchor, NOT the newest seen>",
-     "user_messages":[...the visible newest slice...]}
-
 THE CALLER MUST CHECK status:
   * status=="error"     -> could NOT read. Report the failure and back
     off; never treat it as an idle/all-clear tick. That conflation is
     how the loop goes silently deaf.
-  * status=="truncated" -> read SUCCEEDED but is INCOMPLETE. Process the
-    returned messages, but DO NOT mark the channel drained: set
-    last_user_ts to the returned newest_user_ts (a safe earlier anchor,
-    not the true newest) and re-poll again immediately on the next tick
-    until a status=="ok" poll confirms the window is fully drained.
-    Treating this as idle would permanently skip the dropped older
-    messages.
   * status=="ok"        -> window fully drained; safe to advance.
 
 Bug history (each fix exposed the next):
@@ -37,22 +24,16 @@ Bug history (each fix exposed the next):
      conversations.history volume; with 1-min fast-mode polling the
      token hit HTTP-429 'ratelimited'. And every read was try/except ->
      [] so a hard 429 read as "0 msgs, all clear" -> deaf again.
-  4. Single capped read silently truncates. `clacks read --since T
-     -l 200` calls Slack conversations.history(oldest=T, limit=200)
-     with NO pagination; Slack returns the NEWEST 200 in the window
-     and DROPS the oldest. If >200 messages arrive between polls the
-     oldest unprocessed USER messages vanish, yet the cursor still
-     advanced to the newest -> those messages are skipped forever.
-     Recreates "silently deaf" under burst load. Now detected and
-     surfaced as status=="truncated" with a safe re-poll anchor.
+  4. A capped newest slice silently dropped older messages, while the
+     attempted rewind replayed the same slice forever. The poller now
+     follows Slack's opaque next_cursor until the history window is
+     exhausted, merges every page, and only then returns status=="ok".
 
 In force now:
   * Gate strictly on LAST_USER_TS (advances only on processed user
     messages, never on bot traffic).
-  * ONE read per poll. Use `--since LAST_USER_TS` (semantically "at or
-    after this time"): a Slack ts is a valid --since value and this
-    returns the recent window correctly, unlike `--after` which returns
-    a bounded oldest-first slice anchored at the cursor. One API call.
+  * Use `--since LAST_USER_TS` and follow every response_metadata.next_cursor
+    page. A Slack ts is a valid --since value; `--after` is not used.
   * Distinguish FAILURE from EMPTY by PARSING, never by substring.
     Earlier this code did `if "ratelimited" in (stdout+stderr)` — but a
     SUCCESSFUL conversations.history response contains message *text*,
@@ -68,27 +49,29 @@ import json
 import subprocess
 import sys
 import time
+from decimal import Decimal, InvalidOperation
 
 LIM = "200"
-# Worst-case total sleep = 5+15+30 = 50s, kept strictly under the 60s
-# fast-mode cron interval so a single poll (incl. retries) finishes
-# inside its own tick window and does not bleed into / stack with the
-# next fast-mode tick. 4 attempts total (initial + 3 retries).
+# Each individual page gets four attempts (initial + three retries).
 BACKOFFS = (5, 15, 30)
 
-def _read_once(channel, last_user_ts):
+
+def _read_once(channel, last_user_ts, cursor=None):
     # `--order asc` is the canonical ascending-by-ts shape that ongo's
-    # tick loop expects. Requires slack-clacks >= 0.10.3 (the version
-    # that introduced the flag). The minimum is pinned in SKILL.md
-    # Startup step 1.
+    # tick loop expects. Cursor pagination requires slack-clacks >= 0.14.1.
+    command = [
+        "clacks", "read", "-c", channel, "--since", last_user_ts,
+        "-l", LIM, "--order", "asc",
+    ]
+    if cursor:
+        command.extend(("--cursor", cursor))
     try:
         p = subprocess.run(
-            ["clacks", "read", "-c", channel, "--since", last_user_ts,
-             "-l", LIM, "--order", "asc"],
+            command,
             capture_output=True, text=True, timeout=60,
         )
     except Exception as e:
-        return None, f"subprocess: {e}"
+        return None, None, f"subprocess: {e}"
     out, err = p.stdout.strip(), p.stderr.strip()
     # Parse first. NEVER substring-scan the blob — message bodies (incl.
     # ongo's own status posts) legitimately contain "ratelimited" etc.
@@ -97,37 +80,62 @@ def _read_once(channel, last_user_ts):
     except Exception:
         # Not JSON at all -> a real failure. Inspect stderr only.
         if "ratelimited" in err:
-            return None, "ratelimited"
+            return None, None, "ratelimited"
         if "SlackApiError" in err or "Traceback" in err:
-            return None, "api-error"
-        return None, f"unparseable: {(err or out)[:120]}"
+            return None, None, "api-error"
+        return None, None, f"unparseable: {(err or out)[:120]}"
     if isinstance(data, dict) and data.get("ok") is False:
-        return None, data.get("error", "api-error")
+        return None, None, data.get("error", "api-error")
     if isinstance(data, dict) and "messages" in data:
-        return data["messages"], None
+        metadata = data.get("response_metadata") or {}
+        next_cursor = metadata.get("next_cursor") or ""
+        if data.get("has_more") and not next_cursor:
+            return None, None, "pagination response omitted next_cursor"
+        return data["messages"], next_cursor, None
     if isinstance(data, list):
-        return data, None
-    # Parsed JSON but unexpected shape — treat as empty success.
-    return [], None
+        return data, "", None
+    return None, None, "unexpected JSON response"
 
 
-def poll(channel, last_user_ts):
-    msgs, error = _read_once(channel, last_user_ts)
+def _read_page(channel, last_user_ts, cursor):
+    messages, next_cursor, error = _read_once(channel, last_user_ts, cursor)
     for delay in BACKOFFS:
         if error is None:
             break
         time.sleep(delay)
-        msgs, error = _read_once(channel, last_user_ts)
+        messages, next_cursor, error = _read_once(channel, last_user_ts, cursor)
+    return messages, next_cursor, error
 
-    if error is not None:
-        return {
-            "status": "error",
-            "error": error,
-            "total_seen": 0,
-            "user_count": 0,
-            "newest_user_ts": last_user_ts,
-            "user_messages": [],
-        }
+
+def poll(channel, last_user_ts):
+    messages = []
+    cursor = None
+    seen_cursors = set()
+    while True:
+        page, next_cursor, error = _read_page(channel, last_user_ts, cursor)
+        if error is not None:
+            return {
+                "status": "error",
+                "error": error,
+                "total_seen": 0,
+                "user_count": 0,
+                "newest_user_ts": last_user_ts,
+                "user_messages": [],
+            }
+        messages.extend(page)
+        if not next_cursor:
+            break
+        if next_cursor in seen_cursors:
+            return {
+                "status": "error",
+                "error": "pagination cursor repeated",
+                "total_seen": 0,
+                "user_count": 0,
+                "newest_user_ts": last_user_ts,
+                "user_messages": [],
+            }
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
 
     def is_bot(m):
         # Accept both the loop's [ongo] prefix and the subagent's
@@ -140,42 +148,30 @@ def poll(channel, last_user_ts):
             "[ongo:", "_[ongo:",
         ))
 
-    # clacks returns ascending by ts (`--order asc`), so we just keep
-    # messages that have a ts and trust the order.
-    allm = [m for m in msgs if m.get("ts")]
-    # --since is inclusive; strictly exclude the gate message itself.
-    users = [m for m in allm
-             if not is_bot(m) and m.get("ts", "0") > last_user_ts]
-    newest_user = max((m["ts"] for m in users), default=last_user_ts)
-
-    # Saturation: clacks issues ONE non-paginated conversations.history
-    # with limit=LIM. If the window held >= LIM messages, Slack returned
-    # only the NEWEST LIM and silently dropped everything older. Any user
-    # message older than the oldest returned message is now invisible.
-    # Advancing the cursor to newest_user would skip them forever, so we
-    # surface status=="truncated" and hand back a SAFE anchor: just below
-    # the oldest message we actually saw. The next poll's --since window
-    # then starts there and re-pulls the dropped older slice (the already
-    # handled newer messages may be re-seen — at-least-once delivery is
-    # the only gap-free contract possible without pagination).
-    if len(allm) >= int(LIM):
-        oldest_ts = allm[0]["ts"]
-        try:
-            safe_anchor = f"{float(oldest_ts) - 1e-6:.6f}"
-        except (TypeError, ValueError):
-            safe_anchor = last_user_ts
-        # Never move the cursor backwards past the caller's gate.
-        if safe_anchor < last_user_ts:
-            safe_anchor = last_user_ts
+    by_timestamp = {
+        str(message["ts"]): message for message in messages if message.get("ts")
+    }
+    try:
+        gate = Decimal(str(last_user_ts))
+        allm = sorted(
+            by_timestamp.values(), key=lambda message: Decimal(str(message["ts"]))
+        )
+    except (InvalidOperation, TypeError, ValueError):
         return {
-            "status": "truncated",
-            "total_seen": len(allm),
-            "user_count": len(users),
-            "newest_user_ts": safe_anchor,
-            "user_messages": [
-                {"ts": m["ts"], "text": m.get("text", "")} for m in users
-            ],
+            "status": "error",
+            "error": "invalid Slack timestamp",
+            "total_seen": 0,
+            "user_count": 0,
+            "newest_user_ts": last_user_ts,
+            "user_messages": [],
         }
+    # --since is inclusive; strictly exclude the gate message itself.
+    users = [
+        message
+        for message in allm
+        if not is_bot(message) and Decimal(str(message["ts"])) > gate
+    ]
+    newest_user = users[-1]["ts"] if users else last_user_ts
 
     return {
         "status": "ok",

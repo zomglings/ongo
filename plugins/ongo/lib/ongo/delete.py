@@ -53,6 +53,21 @@ def protect_experiment_publications(publications):
     raise SystemExit(4)
 
 
+def protect_experiment_relationship(relationship):
+    endpoint_kinds = (
+        relationship["subject_kind"] or "",
+        relationship["object_kind"] or "",
+    )
+    if not any(kind.startswith("ongo-experiment") for kind in endpoint_kinds):
+        return
+    print(
+        "error: experiment evidence is append-only and its relationships cannot be deleted with ongo",
+        file=sys.stderr,
+    )
+    print(describe_rel(relationship), file=sys.stderr)
+    raise SystemExit(4)
+
+
 def connect(db_path):
     """Open a connection to the ken database with foreign keys enabled."""
     if not os.path.exists(db_path):
@@ -68,11 +83,26 @@ def connect(db_path):
 def find_relationships_for_pub(conn, pub_id):
     """Return all relationships where the publication is subject or object."""
     rows = conn.execute(
-        "SELECT id, subject, object, kind FROM relationships "
-        "WHERE subject = ? OR object = ?",
+        "SELECT r.id, r.subject, r.object, r.kind, "
+        "subject_pub.kind AS subject_kind, object_pub.kind AS object_kind "
+        "FROM relationships AS r "
+        "JOIN publications AS subject_pub ON subject_pub.id = r.subject "
+        "JOIN publications AS object_pub ON object_pub.id = r.object "
+        "WHERE r.subject = ? OR r.object = ?",
         (pub_id, pub_id),
     ).fetchall()
     return rows
+
+
+def protect_incident_experiment_relationships(conn, publications):
+    """Preflight publication deletion without partially severing evidence."""
+    seen = set()
+    for publication in publications:
+        for relationship in find_relationships_for_pub(conn, publication["id"]):
+            if relationship["id"] in seen:
+                continue
+            seen.add(relationship["id"])
+            protect_experiment_relationship(relationship)
 
 
 def find_notes_for_pub(conn, pub_id):
@@ -130,6 +160,8 @@ def delete_publication(conn, pub_id, dry_run=False):
 
     rels = find_relationships_for_pub(conn, pub_id)
     notes = find_notes_for_pub(conn, pub_id)
+    for rel in rels:
+        protect_experiment_relationship(rel)
 
     print(describe_pub(pub))
     for note in notes:
@@ -156,6 +188,7 @@ def cmd_pub_by_id(conn, pub_id, dry_run=False):
     ).fetchone()
     if row:
         protect_experiment_publications([row])
+        protect_incident_experiment_relationships(conn, [row])
     prefix = "[dry run] " if dry_run else ""
     print(f"{prefix}Deleting publication {pub_id}:")
     count = delete_publication(conn, pub_id, dry_run=dry_run)
@@ -179,6 +212,7 @@ def cmd_pub_by_key(conn, key, dry_run=False):
         print(f"No publications found with key: {key}")
         return
     protect_experiment_publications(pubs)
+    protect_incident_experiment_relationships(conn, pubs)
 
     prefix = "[dry run] " if dry_run else ""
     print(f"{prefix}Deleting {len(pubs)} publication(s) with key={key!r}:")
@@ -207,6 +241,7 @@ def cmd_pub_by_kind(conn, kind, dry_run=False):
         print(f"No publications found with kind: {kind}")
         return
     protect_experiment_publications(pubs)
+    protect_incident_experiment_relationships(conn, pubs)
 
     prefix = "[dry run] " if dry_run else ""
     print(f"{prefix}Deleting {len(pubs)} publication(s) of kind={kind!r}:")
@@ -227,13 +262,19 @@ def cmd_pub_by_kind(conn, kind, dry_run=False):
 def cmd_rel_by_id(conn, rel_id, dry_run=False):
     """Delete a single relationship by its ID."""
     rel = conn.execute(
-        "SELECT id, subject, object, kind FROM relationships WHERE id = ?",
+        "SELECT r.id, r.subject, r.object, r.kind, "
+        "subject_pub.kind AS subject_kind, object_pub.kind AS object_kind "
+        "FROM relationships AS r "
+        "JOIN publications AS subject_pub ON subject_pub.id = r.subject "
+        "JOIN publications AS object_pub ON object_pub.id = r.object "
+        "WHERE r.id = ?",
         (rel_id,),
     ).fetchone()
 
     if not rel:
         print(f"Relationship {rel_id} not found.")
         return
+    protect_experiment_relationship(rel)
 
     prefix = "[dry run] " if dry_run else ""
     print(f"{prefix}Deleting relationship:")

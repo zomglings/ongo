@@ -8,6 +8,7 @@ import binascii
 import hashlib
 import html
 import json
+import math
 import mimetypes
 import os
 import re
@@ -39,7 +40,33 @@ EXPERIMENT_KINDS = (
 
 
 def canonical_json(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def check_finite_json_numbers(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("JSON numbers must be finite")
+    if isinstance(value, dict):
+        for item in value.values():
+            check_finite_json_numbers(item)
+    elif isinstance(value, list):
+        for item in value:
+            check_finite_json_numbers(item)
+
+
+def strict_json_loads(text):
+    def reject_constant(value):
+        raise ValueError(f"non-standard JSON constant {value}")
+
+    value = json.loads(text, parse_constant=reject_constant)
+    check_finite_json_numbers(value)
+    return value
 
 
 def hash_bytes(value):
@@ -137,8 +164,8 @@ def load_json_file(path, field):
     except OSError as error:
         invalid(f"could not read {field}", {"path": path, "error": str(error)})
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as error:
+        return strict_json_loads(text)
+    except (json.JSONDecodeError, ValueError) as error:
         invalid(f"{field} is not valid JSON", {"path": path, "error": str(error)})
 
 
@@ -171,6 +198,10 @@ def normalize_output_files(value, field):
 
 
 def validate_manifest(value):
+    try:
+        check_finite_json_numbers(value)
+    except ValueError as error:
+        invalid("manifest contains a non-finite JSON number", {"error": str(error)})
     require_object(value, "manifest")
     reject_unknown(value, {"schema_version", "title", "conditions"}, "manifest")
     if value.get("schema_version") != SCHEMA_VERSION:
@@ -251,8 +282,19 @@ def validate_manifest(value):
             ):
                 invalid(f"{field}.execution.env must map strings to strings")
             timeout = execution.get("timeout_seconds", 3600)
-            if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
-                invalid(f"{field}.execution.timeout_seconds must be positive")
+            try:
+                timeout_is_finite = math.isfinite(timeout)
+            except (TypeError, OverflowError):
+                timeout_is_finite = False
+            if (
+                not isinstance(timeout, (int, float))
+                or isinstance(timeout, bool)
+                or not timeout_is_finite
+                or timeout <= 0
+            ):
+                invalid(
+                    f"{field}.execution.timeout_seconds must be a finite positive number"
+                )
             accepted = execution.get("accepted_exit_codes", [0])
             if not isinstance(accepted, list) or not accepted or any(
                 not isinstance(item, int) or isinstance(item, bool) for item in accepted
@@ -303,8 +345,8 @@ def validate_manifest(value):
 def parse_body(record, *, expected_object=True):
     body = record.get("body", "")
     try:
-        value = json.loads(body)
-    except json.JSONDecodeError as error:
+        value = strict_json_loads(body)
+    except (json.JSONDecodeError, ValueError) as error:
         raise OngoError(
             "an Ongo publication contains invalid JSON",
             code="corrupt-experiment-record",
@@ -720,10 +762,26 @@ def approve_experiment(client, identifier, delegation_identifier, actor, actor_r
     delegation_record = None
     delegation = None
     authority = "zero-cost-policy"
+    if delegation_identifier:
+        delegation_record, delegation = find_delegation(client, delegation_identifier)
+    expected_delegation = delegation["delegation_id"] if delegation else None
+    for approval in status["approvals"]:
+        if (
+            approval.get("actor") == actor
+            and approval.get("delegation_id") == expected_delegation
+        ):
+            return {"ok": True, "approval": approval, "idempotent": True}
+        conflict(
+            "this exact plan already has a different recorded approval",
+            {
+                "approval_id": approval.get("approval_id"),
+                "actor": approval.get("actor"),
+                "delegation_id": approval.get("delegation_id"),
+            },
+        )
     if total > 0:
         if not delegation_identifier:
             unauthorized("paid experiments require a delegation")
-        delegation_record, delegation = find_delegation(client, delegation_identifier)
         if not delegation_is_live(delegation):
             unauthorized("delegation has expired", {"delegation_id": delegation["delegation_id"]})
         if delegation.get("experiment_id") not in {None, root["experiment_id"]}:
@@ -740,7 +798,6 @@ def approve_experiment(client, identifier, delegation_identifier, actor, actor_r
                 unauthorized("experiment exceeds the delegation's cumulative ceiling")
         authority = delegation["delegation_id"]
     elif delegation_identifier:
-        delegation_record, delegation = find_delegation(client, delegation_identifier)
         if not delegation_is_live(delegation):
             unauthorized("delegation has expired", {"delegation_id": delegation["delegation_id"]})
         if delegation.get("experiment_id") not in {None, root["experiment_id"]}:
@@ -755,21 +812,6 @@ def approve_experiment(client, identifier, delegation_identifier, actor, actor_r
                 {"required_modes": sorted(modes)},
             )
         authority = delegation["delegation_id"]
-    expected_delegation = delegation["delegation_id"] if delegation else None
-    for approval in status["approvals"]:
-        if (
-            approval.get("actor") == actor
-            and approval.get("delegation_id") == expected_delegation
-        ):
-            return {"ok": True, "approval": approval, "idempotent": True}
-        conflict(
-            "this exact plan already has a different recorded approval",
-            {
-                "approval_id": approval.get("approval_id"),
-                "actor": approval.get("actor"),
-                "delegation_id": approval.get("delegation_id"),
-            },
-        )
     approval_id = str(uuid.uuid4())
     body = {
         "schema_version": SCHEMA_VERSION,
@@ -1103,6 +1145,10 @@ def read_artifact_specs(specs):
 
 
 def validate_result(value):
+    try:
+        check_finite_json_numbers(value)
+    except ValueError as error:
+        invalid("result contains a non-finite JSON number", {"error": str(error)})
     require_object(value, "result")
     reject_unknown(
         value,
@@ -1224,7 +1270,7 @@ def cancel_attempt(client, identifier, reason):
         "valid_observation": False,
         "summary": reason,
         "metrics": {},
-        "actual_cost_usd": "0",
+        "actual_cost_usd": None,
     }
     return finish_attempt(client, attempt["attempt_id"], value, {})
 
@@ -1295,7 +1341,7 @@ def run_local(client, identifier):
                 stdout = stdout.encode()
             if isinstance(stderr, str):
                 stderr = stderr.encode()
-        except OSError as error:
+        except Exception as error:
             returncode = None
             stdout = b""
             stderr = str(error).encode("utf-8", errors="replace")

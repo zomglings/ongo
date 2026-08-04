@@ -48,11 +48,13 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
 import tempfile
 import urllib.request
+from pathlib import Path
 
 from .errors import OngoArgumentParser
 
@@ -174,8 +176,32 @@ def ken_show_body(ken, db_path, pub_id, key):
     return body
 
 
+def ken_publication_timestamps(db_path):
+    """Read the one publication field that Ken v3's JSON API omits.
+
+    All publication content and relationships still flow through Ken's CLI.
+    The site uses a read-only SQLite connection solely for ``created_at`` so
+    it can preserve the established date labels and chronological ordering
+    while the pinned Ken v3 interface remains unchanged.
+    """
+    uri = f"{Path(db_path).expanduser().resolve().as_uri()}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            rows = connection.execute(
+                "SELECT id, created_at FROM publications"
+            ).fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        raise SystemExit(
+            f"error: could not read publication timestamps from Ken database: {exc}"
+        )
+    return {publication_id: created_at for publication_id, created_at in rows}
+
+
 class KenView:
-    """Read-only site projection built exclusively through the Ken v3 CLI."""
+    """Read-only site projection over Ken v3 records."""
 
     def __init__(self, ken, db_path):
         self.ken = ken
@@ -184,9 +210,10 @@ class KenView:
         self.by_id = {}
         self.by_key = {}
         self._shown = {}
+        timestamps = ken_publication_timestamps(db_path)
         for rank, raw in enumerate(ken_list(ken, db_path)):
             row = dict(raw)
-            row["created_at"] = row.get("created_at")
+            row["created_at"] = row.get("created_at") or timestamps.get(row["id"])
             row["list_rank"] = rank
             self.rows.append(row)
             self.by_id[row["id"]] = row

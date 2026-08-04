@@ -21,9 +21,9 @@ args: "[--channel <channel_id>] [--interval <minutes>] [--idle]"
 **jq**: `command -v jq` — if missing, tell the user to install it and halt.
 
 **clacks**: `command -v clacks` — if missing, run
-`uv tool install 'slack-clacks>=0.10.3' || pip install 'slack-clacks>=0.10.3'`.
-The version floor is load-bearing because `ongo slack poll` requires ascending
-Slack timestamp order.
+`uv tool install 'slack-clacks>=0.14.1' || pip install 'slack-clacks>=0.14.1'`.
+The version floor is load-bearing because `ongo slack poll` requires explicit
+Slack cursor pagination and ascending timestamp order.
 
 The plugin-root `bin/` directory is on Claude Code's Bash `PATH`. Use the
 plugin-shipped `ongo` command; never reconstruct a plugin-cache path. After jq
@@ -106,15 +106,14 @@ The tick prompt must be **self-contained** since each cron fire is a fresh conte
 > 1. Read state: `cat /tmp/ongo_state.json`
 > 2. Poll Slack with the robust poller: `ongo slack poll "$CHANNEL" "$LAST_USER_TS"` — returns JSON `{status, total_seen, user_count, newest_user_ts, user_messages[]}`. Do **not** call `clacks read --after` directly (see "Polling correctly" below). **Check `status` first** (load-bearing — see "Polling correctly"):
 >    - `status == "error"`: the read **failed** (rate limit / API error). This is **not** an idle tick. Send `_[ongo] Poll failed (<error>) — backing off, will retry next tick._`, **leave `last_user_ts` unchanged**, do **not** run auto-expansion, do **not** increment `fast_idle_polls`, and if `error == "ratelimited"` and `mode == "fast"` revert to `normal_cron` (see "Slack API rate-limit budget"), then end the tick.
->    - `status == "truncated"`: the read succeeded but the window was **saturated** (>200 msgs since last poll; Slack dropped the oldest). Process the returned messages as in step 4, then set `last_user_ts = newest_user_ts` (a safe earlier anchor the poller chose, **not** the true newest) and **immediately schedule another poll** (treat as fast-mode / re-poll next tick) until a `status == "ok"` poll confirms the channel is fully drained. Do **not** treat as idle.
->    - `status == "ok"`: window fully drained; proceed normally.
+>    - `status == "ok"`: every Slack cursor page in the window was read; proceed normally.
 > 3. The poller filters out `[ongo]`/`_[ongo]` bot messages and returns only user messages with `ts > LAST_USER_TS`, ascending by `ts`.
-> 4. **If `status` is `ok`/`truncated` and `user_count > 0`**: send `_[ongo] Processing..._`, process **every** returned user message in ascending order (do not skip any, even if you also spawn a background agent for one).
+> 4. **If `status == "ok"` and `user_count > 0`**: send `_[ongo] Processing..._`, process **every** returned user message in ascending order (do not skip any, even if you also spawn a background agent for one).
 > 5. **If `status == "ok"` AND no user messages AND not idle**: run auto-expansion — pick a topic from kendb weighted by exploration directives, launch a background research subagent (rotate: reference/Sonnet → deep notes/Opus → survey/Opus). There are **no per-topic refresh fields**; a frequently-prioritized topic stays fresh purely via its directive weight. (A `status == "error"` poll is never an idle tick — do not expand on it.)
 > 6. **If 24h since last_self_improve**: run self-improvement cycle (layers A–E per SKILL.md).
 > 7. **On `/quit`, `/stop`, `/exit`**: send `_[ongo] Shutting down._`, then CronDelete `cron_id` **and** sweep for orphan crons (any cron whose prompt begins `Run one ongo research agent tick.` — fast-mode/renewal swaps may have left a stale one), and stop. See "Shutdown".
-> 8. **Fast-mode transition** (see "Fast mode"), only when `status != "error"`: if `user_count > 0` (or `status == "truncated"`), reset `fast_idle_polls=0` and enter fast mode (1-min cron) if currently normal via the **safe cron-swap procedure**; if `user_count == 0` and `status == "ok"` and in fast mode, increment `fast_idle_polls` and exit to `normal_cron` after it reaches 5.
-> 9. **Only after every returned user message has been handled/dispatched**, advance `last_user_ts` to the **longest fully-handled ascending prefix** of `user_messages` (the last message such that it and every earlier message was handled/dispatched-OK) and write state back — this equals `newest_user_ts` only if the whole batch succeeded; if a middle message failed, stop at the last good one *before the hole*. If `status == "error"` or `user_count == 0`, leave `last_user_ts` unchanged. On `status == "truncated"` advance to the poller's (deliberately earlier) `newest_user_ts` and re-poll until `ok`. **Never** advance past an unprocessed/failed user message, and **never** advance because the bot sent a message. A re-surfaced already-answered message is the accepted cost of never losing one. Load-bearing: see "Polling correctly".
+> 8. **Fast-mode transition** (see "Fast mode"), only when `status != "error"`: if `user_count > 0`, reset `fast_idle_polls=0` and enter fast mode (1-min cron) if currently normal via the **safe cron-swap procedure**; if `user_count == 0` and `status == "ok"` and in fast mode, increment `fast_idle_polls` and exit to `normal_cron` after it reaches 5.
+> 9. **Only after every returned user message has been handled/dispatched**, advance `last_user_ts` to the **longest fully-handled ascending prefix** of `user_messages` (the last message such that it and every earlier message was handled/dispatched-OK) and write state back — this equals `newest_user_ts` only if the whole batch succeeded; if a middle message failed, stop at the last good one *before the hole*. If `status == "error"` or `user_count == 0`, leave `last_user_ts` unchanged. **Never** advance past an unprocessed/failed user message, and **never** advance because the bot sent a message. A re-surfaced already-answered message is the accepted cost of never losing one. Load-bearing: see "Polling correctly".
 >
 > Always prepend `[ongo]` to every Slack message. Ken binary at: $KEN. Truncate responses over 30000 chars.
 
@@ -176,14 +175,13 @@ Each tick is self-contained. It reads state from `/tmp/ongo_state.json`, execute
 3. **Cron renewal check**: if current time minus `cron_created` > 259200 (3 days), renew the cron job via the **safe cron-swap procedure** (CronCreate new → write state → CronDelete old → log `ongo-cron-reset`; see "Cron renewal"). Never delete the old cron before the new one exists.
 4. Poll: `ongo slack poll "$CHANNEL" "$LAST_USER_TS"`. Parse its JSON and **branch on `status`** (this check is load-bearing — a missing-status check is exactly how the loop went silently deaf historically):
    - `status == "error"`: read **failed** (rate limit / API error). Send `_[ongo] Poll failed (<error>) — backing off._`, leave `LAST_USER_TS` unchanged, **skip steps 6–9** (no expansion, no fast-mode counter change). If `error == "ratelimited"`, additionally follow the cadence back-off in "Slack API rate-limit budget" (revert fast mode if active). End tick.
-   - `status == "truncated"`: read succeeded but window saturated (>200 msgs; Slack dropped oldest). Handle returned messages (step 6), set `LAST_USER_TS = newest_user_ts` (the poller's safe earlier anchor), and force a re-poll (stay in / enter fast mode) until a `status == "ok"` poll. Never treat as idle.
-   - `status == "ok"`: proceed normally.
+   - `status == "ok"`: every Slack cursor page in the window was read; proceed normally.
 5. `user_messages` (bot-filtered, `ts > LAST_USER_TS`, ascending) are the messages to handle.
-6. **`user_count > 0`** (status `ok` or `truncated`): send `_[ongo] Processing..._`, then for **every** message in ascending order: process it (or dispatch a background agent for it), respond via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`. Do not skip any, even partially-handled ones. **A message is "handled" only once it has either been answered inline or successfully dispatched to a background agent that acknowledged start.** If processing or dispatch of message *i* fails (exception, agent failed to launch, dispatch errored), stop treating later messages as gating: record the *highest ts that was fully handled with no unhandled message before it* — this, not `newest_user_ts`, is what step 10 may advance to. A dispatched agent that later *fails mid-work* must post the failure to Slack so the user can re-ask.
+6. **`user_count > 0`**: send `_[ongo] Processing..._`, then for **every** message in ascending order: process it (or dispatch a background agent for it), respond via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`. Do not skip any, even partially-handled ones. **A message is "handled" only once it has either been answered inline or successfully dispatched to a background agent that acknowledged start.** If processing or dispatch of message *i* fails (exception, agent failed to launch, dispatch errored), stop treating later messages as gating: record the *highest ts that was fully handled with no unhandled message before it* — this, not `newest_user_ts`, is what step 10 may advance to. A dispatched agent that later *fails mid-work* must post the failure to Slack so the user can re-ask.
 7. **`status == "ok"` AND no user messages AND not idle**: run auto-expansion (see Auto-Expansion section). (Never on `status == "error"`.)
 8. **24h since last_self_improve** (or user requested): run self-improvement, update last_self_improve.
-9. **Fast-mode transition** (see "Fast mode"), only when `status != "error"`: `user_count > 0` or `status == "truncated"` → `fast_idle_polls=0`, enter fast mode if normal (no swap if already fast); `user_count == 0` and `status == "ok"` and fast → `fast_idle_polls++`, exit to `normal_cron` at 5. Every mode change uses the **safe cron-swap procedure** (create-then-delete; see "Cron renewal").
-10. Advance the gate to the **longest fully-handled ascending prefix**, never blindly to `newest_user_ts`. Concretely: walk `user_messages` ascending; set `LAST_USER_TS` to the ts of the last message such that *it and every message before it* was handled (step 6 definition). If the whole batch succeeded this equals `newest_user_ts`. If a middle message failed, the gate stays at the last good message *before the hole* — the failed message and everything after it stay outstanding and are re-polled next tick. **Never advance past a hole**, even though that means already-answered later messages in the same batch will be re-surfaced and re-answered (accepted: see "Reprocessing"). If `status == "error"` or `user_count == 0`, leave `LAST_USER_TS` unchanged. On `status == "truncated"` advance to the poller's deliberately-earlier `newest_user_ts`. Then write state back.
+9. **Fast-mode transition** (see "Fast mode"), only when `status != "error"`: `user_count > 0` → `fast_idle_polls=0`, enter fast mode if normal (no swap if already fast); `user_count == 0` and `status == "ok"` and fast → `fast_idle_polls++`, exit to `normal_cron` at 5. Every mode change uses the **safe cron-swap procedure** (create-then-delete; see "Cron renewal").
+10. Advance the gate to the **longest fully-handled ascending prefix**, never blindly to `newest_user_ts`. Concretely: walk `user_messages` ascending; set `LAST_USER_TS` to the ts of the last message such that *it and every message before it* was handled (step 6 definition). If the whole batch succeeded this equals `newest_user_ts`. If a middle message failed, the gate stays at the last good message *before the hole* — the failed message and everything after it stay outstanding and are re-polled next tick. **Never advance past a hole**, even though that means already-answered later messages in the same batch will be re-surfaced and re-answered (accepted: see "Reprocessing"). If `status == "error"` or `user_count == 0`, leave `LAST_USER_TS` unchanged. Then write state back.
 
 ### Polling correctly
 
@@ -192,9 +190,9 @@ Each tick is self-contained. It reads state from `/tmp/ongo_state.json`, execute
 - **Capped slice.** `clacks read --after` returns a bounded *oldest-first* slice (~15–20 msgs) anchored at `--after`, not a stream of everything since. Once the bot's own `[ongo]` messages exceed that slice it is pure bot chatter and real user messages further ahead are never returned — the filter then truthfully reports "0 user messages" of a window that structurally cannot contain them.
 - **Bot-contaminated cursor.** The first fix advanced the cursor to the newest message *including the bot's own sends*. A user message timestamped before one of the bot's sends but after the previous cursor was then excluded by the `> cursor` filter next poll — silently missed because the bot "spoke later." This actually happened (four user messages lost in one busy turn).
 - **Three reads / poll → masked rate limit.** A later design issued three reads per poll (`recent` + `--since` + `--after`); under 1-min fast-mode polling this tripped Slack HTTP-429 `ratelimited`, and because every read was `try/except -> []` a hard 429 was read as "0 messages, all clear" — deaf again.
-- **Single capped read silently truncates.** The current poller issues exactly **one** `clacks read --since LAST_USER_TS -l 200`, which becomes a single non-paginated Slack `conversations.history(oldest=LAST_USER_TS, limit=200, inclusive=True)`. Slack returns the **newest 200** in the window and **silently drops the oldest** when more exist. If >200 messages land between polls the oldest unprocessed *user* messages disappear while the cursor still advances — permanently skipped. The poller now detects saturation (`total_seen >= 200`) and returns `status == "truncated"` with a deliberately *earlier* `newest_user_ts` anchor (just below the oldest message actually seen), so the next poll's `--since` window re-covers the dropped older slice.
+- **Single capped read silently truncates.** A single `clacks read --since LAST_USER_TS -l 200` returns only the newest page. The attempted timestamp rewind could only replay that same page, so older messages remained invisible. The poller now follows every opaque `response_metadata.next_cursor` from Clacks, merges and deduplicates the pages, sorts the complete window by exact Slack timestamp, and returns `ok` only after the cursor is exhausted.
 
-**The poller contract.** `ongo slack poll` takes `LAST_USER_TS`, issues **one** `--since LAST_USER_TS` read (a Slack `ts` is a valid `--since` value; clacks relative strings like `"2 hours ago"` silently return nothing — only a `ts`/epoch works, and `--after` is unsafe per the bugs above), filters out `[ongo]`/`_[ongo]` bot messages, returns user messages with `ts > LAST_USER_TS` ascending, and a `status` of `ok` / `truncated` / `error` (with exponential back-off 5/15/30s — under the 60s fast cron — on transient read failure before reporting `error`). **The caller MUST branch on `status`** (see Tick steps): `error` ≠ idle (back off, do not advance, do not expand); `truncated` ≠ drained (process, advance to the safe anchor, re-poll until `ok`); only `ok` means the window is fully drained. Conflating `error`/`truncated` with "0 user messages → idle" is precisely how the loop goes silently deaf.
+**The poller contract.** `ongo slack poll` takes `LAST_USER_TS`, issues `--since LAST_USER_TS` and follows every Slack cursor page (a Slack `ts` is a valid `--since` value; `--after` is unsafe per the bugs above), filters out `[ongo]`/`_[ongo]` bot messages, deduplicates and returns user messages with `ts > LAST_USER_TS` ascending, and returns `ok` only after the cursor is exhausted. Any page failure returns `error` with no partial messages and leaves the gate unchanged; each failed page gets exponential back-off 5/15/30s. **The caller MUST branch on `status`**: `error` is not idle and must not advance the gate or trigger expansion.
 
 **The invariant.** After the one-time `STARTUP_TS` bootstrap anchor, the gate is
 `LAST_USER_TS` = ts of the most recent USER message *actually processed*. It
@@ -204,10 +202,9 @@ bot-influenced cursor — bot/loop traffic is irrelevant to whether a user messa
 is outstanding. Process the whole returned batch each tick in ascending order;
 only then advance `LAST_USER_TS` over the fully-handled prefix (Tick step 10).
 The delivery guarantee is **at-least-once, never-lost**: "every user message is
-eventually processed; under saturation or a mid-batch failure a small newer
-slice may be re-seen" — *not* "exactly once," which is impossible without
-pagination, and *not* "ride the head of the channel." At-least-once with bounded
-duplication is strictly safer than the silent drop it replaces. Slack `ts` are
+eventually processed; after a mid-batch handling failure a newer suffix may be
+re-seen" — not "exactly once" and not "ride the head of the channel."
+At-least-once with bounded duplication is strictly safer than silent drops. Slack `ts` are
 canonical `<10-digit-seconds>.<6-digit-micros>` strings; in the current epoch
 era (2001–2286) integer width is fixed, so the poller's lexicographic `ts`
 comparison is equivalent to numeric ordering for all genuine message timestamps.
@@ -226,7 +223,7 @@ Cron expressions: normal = `normal_cron`; fast = `"* * * * *"` (every minute).
 
 Transition logic, evaluated every tick **after** polling and message handling, **before** the state write:
 
-- **`user_count > 0`** (the user said something) or `status == "truncated"`: set `fast_idle_polls = 0`. If `mode == "normal"`, **enter fast mode**: perform the **safe cron-swap procedure** (see "Cron renewal") with the new expression `"* * * * *"` and the same tick prompt; also set `mode = "fast"` in the same state write. (`recurring: true`, `durable: true` — same as every other CronCreate.) If `mode == "fast"` already, do **not** swap — only the `fast_idle_polls = 0` reset applies (no cron churn for an ongoing back-and-forth).
+- **`user_count > 0`** (the user said something): set `fast_idle_polls = 0`. If `mode == "normal"`, **enter fast mode**: perform the **safe cron-swap procedure** (see "Cron renewal") with the new expression `"* * * * *"` and the same tick prompt; also set `mode = "fast"` in the same state write. (`recurring: true`, `durable: true` — same as every other CronCreate.) If `mode == "fast"` already, do **not** swap — only the `fast_idle_polls = 0` reset applies (no cron churn for an ongoing back-and-forth).
 - **`user_count == 0` and `status == "ok"` and `mode == "fast"`**: increment `fast_idle_polls`. If `fast_idle_polls >= 5`, **exit fast mode**: perform the **safe cron-swap procedure** with the new expression `normal_cron`; in the same state write set `mode = "normal"` and `fast_idle_polls = 0`.
 - **`mode == "normal"` and `user_count == 0`**: nothing.
 - **`status == "error"`**: no fast-mode transition counter change; if `error == "ratelimited"` and `mode == "fast"`, revert to `normal_cron` per "Slack API rate-limit budget".
@@ -248,18 +245,18 @@ Slack rate-limits **per method, per workspace**. The two methods ongo uses:
 
 | Operation | `read` calls | `send` calls |
 |---|---|---|
-| `ongo slack poll` | 1 (up to 4 with internal back-off retries on 429/error) | 0 |
+| `ongo slack poll` | 1 per cursor page (up to 4 attempts for a failing page) | 0 |
 | `_[ongo] Processing..._` | 0 | 1 (only if `user_count > 0`) |
 | Per user message reply | 0 | 1 × `user_count` |
 | Fast-mode / cron-reset status post | 0 | 0–1 |
 | Auto-expansion subagent report | 0 | 1 (idle ticks, async) |
 | Self-improvement reports (every 24h) | 0 | up to ~6 |
 
-A normal idle tick is **1 read + 0 sends**. A busy fast-mode tick with a 3-message burst is **1 read + 4 sends**.
+A normal idle tick and a burst fitting one Slack page use **1 read**. A backlog spanning `P` pages uses `P` reads; a 3-message busy tick uses **1 read + 4 sends**.
 
-**The real incident**: an earlier design did 3 reads/poll and fast mode polled every 60s unconditionally; `3 reads × 60 polls/hr = 180 reads/hr` plus ad-hoc reads pushed `conversations.history` over Tier 3 and the token got HTTP-429 `ratelimited`, which the loop then mis-read as "0 messages, all clear" and went deaf. The poller is now **1 read/poll** with bounded exponential back-off (5/15/30s), which fixes the volume. The remaining exposure is **cadence**, not volume:
+**The real incident**: an earlier design did 3 overlapping reads/poll and fast mode polled every 60s unconditionally; ad-hoc reads then pushed `conversations.history` into HTTP-429, which was mis-read as "0 messages, all clear." The poller now makes one read for an ordinary tick and adds reads only when Slack supplies an explicit continuation cursor; failed pages use bounded exponential back-off.
 
-**Safe ceiling**: at 1 read/poll, even sustained 1-min fast-mode polling is `60 reads/hr` — well under Tier 3's ~3000/hr. The budget is comfortable **as long as the poller stays at one read per poll and the back-off is respected**. Do not reintroduce multi-read polling, and do not add ad-hoc `clacks read` calls outside `ongo slack poll`.
+**Safe ceiling**: ordinary sustained 1-min polling is `60 reads/hr`; cursor pages add requests only in proportion to a real backlog. Do not add speculative or ad-hoc `clacks read` calls outside `ongo slack poll`. If pagination reaches Slack's limit, the page returns `ratelimited`, the poller leaves the gate unchanged, and the cadence back-off below applies.
 
 **Rate-limit-aware back-off (cadence)**: if `ongo slack poll` returns `status == "error"` with `error == "ratelimited"` (the poller has already exhausted its internal ~50s back-off), the tick **must not** treat it as idle and **must not** keep hammering at the current cadence:
 

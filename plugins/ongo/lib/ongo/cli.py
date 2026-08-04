@@ -98,10 +98,10 @@ def clacks_version():
     match = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
     version = tuple(int(part) for part in match.groups()) if match else None
     return {
-        "ok": result.returncode == 0 and version is not None and version >= (0, 10, 3),
+        "ok": result.returncode == 0 and version is not None and version >= (0, 14, 1),
         "path": binary,
         "version": text,
-        "minimum": "0.10.3",
+        "minimum": "0.14.1",
     }
 
 
