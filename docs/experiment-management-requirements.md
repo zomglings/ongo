@@ -1,6 +1,6 @@
 # Deterministic Experiment Management Pilot Contract
 
-Status: implemented pilot contract for Ongo 0.4.0
+Status: implemented pilot contract for Ongo 0.5.1
 
 ## Claim
 
@@ -50,7 +50,10 @@ the declared number of valid observations.
 6. `finish` atomically records a terminal result and every artifact. Invalid or
    failed observations remain visible and do not satisfy coverage.
 7. Retries are explicit and budget checked. They never replace prior attempts.
-8. `verify` succeeds only when every required run has a valid observation and
+8. Free-form Markdown notes append documentary context to an experiment,
+   condition, or attempt. Existing Ken topics may tag a note, but the note never
+   changes approval, cost, validity, retry eligibility, or coverage.
+9. `verify` succeeds only when every required run has a valid observation and
    there is no open or excess valid work.
 
 Once the first attempt starts, the plan is frozen. A changed protocol is a new
@@ -60,7 +63,10 @@ The generated Ongo site has an Experiments tab. It lists only experiment roots
 with an explicit `ongo-web` marker. Results and artifacts remain absent unless
 separately marked. Each published experiment resource independently remains
 public or is AES-GCM encrypted for its effective `ongo-readable-by` access
-keys; protection never implicitly spreads from a root to an artifact.
+keys; protection never implicitly spreads from a root to an artifact. Notes are
+rendered only inside their experiment resource. If a note or one of its topic
+labels has narrower access, the site builder rejects a broader experiment page
+instead of leaking the derived text.
 
 ## Pilot interfaces
 
@@ -72,6 +78,10 @@ ongo experiment create --document PLAN.md --manifest MANIFEST.json
 ongo experiment show ID --format json|markdown
 ongo experiment render ID --out DIR
 ongo experiment status ID --json
+ongo experiment note add ID --actor LABEL (--text TEXT | --file NOTE.md)
+  [--condition CONDITION | --attempt ATTEMPT] [--topic TOPIC ...]
+  [--operation-key KEY]
+ongo experiment note list ID --format json|markdown
 ongo experiment delegate create ...
 ongo experiment approve ID [--delegation ID] --actor LABEL
 ongo experiment begin ID --worker LABEL
@@ -90,6 +100,7 @@ The CLI also consolidates existing behavior under `ongo slack poll`,
 
 Retain document and manifest hashes; delegation and approval records; expected
 and reported actual cost; every condition, attempt, retry, and cancellation;
+append-only experiment, condition, and attempt notes with actor and topics;
 local argv, cwd, environment additions, timing, exit code, stdout, and stderr;
 artifact media type, encoding, byte size, and SHA-256; and the final coverage
 report with every discrepancy.

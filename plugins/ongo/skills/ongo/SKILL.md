@@ -360,13 +360,26 @@ return the budget/authorization discrepancy to the user before doing work.
   after a deliberate retry decision; retries are never automatic.
 - Cancel interrupted work explicitly with
   `ongo experiment cancel <attempt-id> --reason <text>`.
+- Record protocol difficulties, deviations, observations, and interpretation as
+  append-only Markdown with `ongo experiment note add <id> --actor <label>
+  (--text <markdown> | --file NOTE.md)`. A note targets the experiment by
+  default; use `--condition <condition-id>` or `--attempt <attempt-id>` for a
+  narrower target. Use repeatable `--topic <topic-id-or-key>` only for existing,
+  unambiguous Ken `topic` publications, and use `--operation-key <key>` when a
+  retry-safe caller operation is available. Review the record with
+  `ongo experiment note list <id> --format markdown`.
+- Notes are documentary and never alter the frozen plan, approval, budget,
+  attempt result, or coverage. If a deviation invalidates an observation, set
+  `valid_observation` to `false` in the attempt result as well as explaining why
+  in a note; a note alone cannot invalidate or validate an attempt.
 - Always finish with `ongo experiment verify <id> --json`. Exit code 6 means
   planned coverage remains incomplete; report the stored discrepancy instead
   of declaring completion from memory.
 
 Experiment artifacts, including binary content, are immutable Ken publications.
 The public site shows an experiment only after an explicit `ongo-web` marker;
-artifact publications require their own markers.
+its notes appear within that experiment view and cannot be published as
+standalone resources. Artifact publications require their own markers.
 
 ## Auto-Expansion
 

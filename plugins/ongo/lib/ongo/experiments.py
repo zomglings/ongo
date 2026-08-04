@@ -36,6 +36,7 @@ EXPERIMENT_KINDS = (
     "ongo-experiment-attempt",
     "ongo-experiment-result",
     "ongo-experiment-artifact",
+    "ongo-experiment-note",
 )
 
 
@@ -403,6 +404,281 @@ def find_attempt(client, identifier):
     return matches[0]
 
 
+def find_topics(client, identifiers):
+    rows = client.list_kind("topic")
+    resolved = {}
+    for identifier in identifiers or []:
+        if not isinstance(identifier, str) or not identifier.strip():
+            invalid("topic references must be non-empty strings")
+        identifier = identifier.strip()
+        matches = {
+            row["id"]: row
+            for row in rows
+            if identifier in {row.get("id"), row.get("key")}
+        }
+        if not matches:
+            invalid("topic not found", {"topic": identifier})
+        if len(matches) > 1:
+            conflict("topic identifier is ambiguous", {"topic": identifier})
+        row = next(iter(matches.values()))
+        resolved[row["id"]] = row
+    return [resolved[record_id] for record_id in sorted(resolved)]
+
+
+def corrupt_note(record, message, details=None):
+    raise OngoError(
+        message,
+        code="corrupt-experiment-record",
+        exit_code=3,
+        details={"id": record.get("id"), **(details or {})},
+    )
+
+
+def validate_note_body(record, body):
+    required = {
+        "schema_version",
+        "note_id",
+        "experiment_id",
+        "target_type",
+        "target_id",
+        "target_record_id",
+        "actor",
+        "markdown",
+        "operation_key",
+        "created_at",
+    }
+    if not isinstance(body, dict) or set(body) != required:
+        corrupt_note(record, "an experiment note has an invalid schema")
+    if body.get("schema_version") != SCHEMA_VERSION:
+        corrupt_note(record, "an experiment note has an unsupported schema")
+    for field in (
+        "note_id",
+        "experiment_id",
+        "target_id",
+        "target_record_id",
+        "actor",
+        "markdown",
+        "created_at",
+    ):
+        if not isinstance(body.get(field), str) or not body[field]:
+            corrupt_note(record, "an experiment note has an invalid field", {"field": field})
+    if body.get("target_type") not in {"experiment", "condition", "attempt"}:
+        corrupt_note(record, "an experiment note has an invalid target type")
+    operation_key = body.get("operation_key")
+    if operation_key is not None and (
+        not isinstance(operation_key, str) or not operation_key
+    ):
+        corrupt_note(record, "an experiment note has an invalid operation key")
+    try:
+        parse_time(body["created_at"], "note.created_at")
+    except OngoError as error:
+        corrupt_note(record, "an experiment note has an invalid timestamp", {"error": str(error)})
+    return body
+
+
+def note_topics(client, record):
+    topics = {}
+    for relationship in record.get("relationships", []):
+        if (
+            relationship.get("role") != "subject"
+            or relationship.get("relkind") != "related-to"
+        ):
+            continue
+        related = client.show(relationship.get("publication"), check=False)
+        if related is not None and related.get("kind") == "topic":
+            topics[related["id"]] = {
+                "record_id": related["id"],
+                "key": related.get("key"),
+                "title": related.get("title") or related.get("key") or related["id"],
+            }
+    return sorted(topics.values(), key=lambda item: (item["title"].casefold(), item["record_id"]))
+
+
+def note_view(client, record, body):
+    validate_note_body(record, body)
+    attachments = [
+        relationship
+        for relationship in record.get("relationships", [])
+        if relationship.get("role") == "subject"
+        and relationship.get("relkind") == "ongo-note-for"
+    ]
+    if (
+        len(attachments) != 1
+        or attachments[0].get("publication") != body["target_record_id"]
+    ):
+        corrupt_note(record, "an experiment note has an invalid target relationship")
+    return {
+        **body,
+        "record_id": record["id"],
+        "key": record.get("key"),
+        "topics": note_topics(client, record),
+    }
+
+
+def experiment_notes(client, identifier):
+    root_record, root = find_experiment(client, identifier)
+    experiment_id = root["experiment_id"]
+    conditions = {
+        record["id"]: body
+        for record, body in experiment_records(
+            client, experiment_id, "ongo-experiment-condition"
+        )
+    }
+    attempts = {
+        record["id"]: body
+        for record, body in experiment_records(
+            client, experiment_id, "ongo-experiment-attempt"
+        )
+    }
+    targets = {
+        root_record["id"]: ("experiment", experiment_id),
+        **{
+            record_id: ("condition", body["id"])
+            for record_id, body in conditions.items()
+        },
+        **{
+            record_id: ("attempt", body["attempt_id"])
+            for record_id, body in attempts.items()
+        },
+    }
+    notes = []
+    for record, body in experiment_records(
+        client, experiment_id, "ongo-experiment-note"
+    ):
+        note = note_view(client, record, body)
+        expected = targets.get(note["target_record_id"])
+        if expected != (note["target_type"], note["target_id"]):
+            corrupt_note(
+                record,
+                "an experiment note targets a record outside its experiment",
+            )
+        notes.append(note)
+    return sorted(notes, key=lambda item: (item["created_at"], item["record_id"]))
+
+
+def add_experiment_note(
+    client,
+    identifier,
+    *,
+    actor,
+    markdown,
+    condition_id=None,
+    attempt_identifier=None,
+    topic_identifiers=None,
+    operation_key=None,
+):
+    if not isinstance(actor, str) or not actor.strip():
+        invalid("actor must be a non-empty label")
+    if not isinstance(markdown, str) or not markdown.strip():
+        invalid("experiment note text must not be empty")
+    actor = actor.strip()
+    if condition_id is not None and attempt_identifier is not None:
+        invalid("an experiment note may target a condition or an attempt, not both")
+    if operation_key is not None:
+        if not isinstance(operation_key, str) or not operation_key.strip():
+            invalid("operation_key must be a non-empty string")
+        operation_key = operation_key.strip()
+        if len(operation_key) > 256:
+            invalid("operation_key must not exceed 256 characters")
+
+    root_record, root = find_experiment(client, identifier)
+    target_record = root_record
+    target_type = "experiment"
+    target_id = root["experiment_id"]
+    if condition_id is not None:
+        matches = [
+            pair
+            for pair in condition_pairs(client, root)
+            if pair[1]["id"] == condition_id
+        ]
+        if not matches:
+            invalid("condition not found", {"condition": condition_id})
+        target_record, condition = matches[0]
+        target_type = "condition"
+        target_id = condition["id"]
+    elif attempt_identifier is not None:
+        target_record, attempt = find_attempt(client, attempt_identifier)
+        if attempt.get("experiment_id") != root["experiment_id"]:
+            invalid(
+                "attempt does not belong to the experiment",
+                {"attempt": attempt_identifier},
+            )
+        target_type = "attempt"
+        target_id = attempt["attempt_id"]
+
+    topics = find_topics(client, topic_identifiers)
+    semantic = {
+        "experiment_id": root["experiment_id"],
+        "target_type": target_type,
+        "target_id": target_id,
+        "target_record_id": target_record["id"],
+        "actor": actor,
+        "markdown": markdown,
+        "operation_key": operation_key,
+    }
+    if operation_key is not None:
+        key = f"{root_record['key']}:note:operation:{hash_text(operation_key)}"
+        existing = client.unique_by_key("ongo-experiment-note", key)
+        if existing is not None:
+            existing_note = note_view(client, existing, parse_body(existing))
+            existing_semantic = {
+                field: existing_note[field] for field in semantic
+            }
+            existing_topics = sorted(
+                topic["record_id"] for topic in existing_note["topics"]
+            )
+            expected_topics = sorted(topic["id"] for topic in topics)
+            if existing_semantic != semantic or existing_topics != expected_topics:
+                conflict(
+                    "operation key already identifies a different experiment note",
+                    {"operation_key": operation_key},
+                )
+            return {
+                "ok": True,
+                "note": existing_note,
+                "idempotent": True,
+            }
+    else:
+        key = None
+
+    note_id = str(uuid.uuid4())
+    if key is None:
+        key = f"{root_record['key']}:note:{note_id}"
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "note_id": note_id,
+        **semantic,
+        "created_at": utc_now(),
+    }
+    relationships = [
+        {"subject": "note", "object": target_record["id"], "kind": "ongo-note-for"},
+        *[
+            {"subject": "note", "object": topic["id"], "kind": "related-to"}
+            for topic in topics
+        ],
+    ]
+    loaded = client.load(
+        {
+            "publications": [
+                {
+                    "ref": "note",
+                    "kind": "ongo-experiment-note",
+                    "key": key,
+                    "title": "Experiment note",
+                }
+            ],
+            "relationships": relationships,
+            "notes": [{"publication": "note", "body": canonical_json(body)}],
+        }
+    )
+    record = client.show(loaded["refs"]["note"])
+    return {
+        "ok": True,
+        "note": note_view(client, record, body),
+        "idempotent": False,
+    }
+
+
 def experiment_records(client, experiment_id, kind):
     return [
         (record, body)
@@ -577,6 +853,13 @@ def state_for_experiment(client, identifier):
         for _, body in experiment_records(client, experiment_id, "ongo-experiment-approval")
         if body.get("manifest_sha256") == root["manifest_sha256"]
     ]
+    notes = experiment_notes(client, experiment_id)
+    note_counts = {
+        target_type: sum(
+            1 for note in notes if note["target_type"] == target_type
+        )
+        for target_type in ("experiment", "condition", "attempt")
+    }
     return {
         "ok": True,
         "experiment_id": experiment_id,
@@ -598,6 +881,8 @@ def state_for_experiment(client, identifier):
         "remaining_runs": max(planned - valid, 0),
         "extra_valid_runs": extra_valid,
         "complete": valid == planned and open_count == 0 and extra_valid == 0,
+        "note_count": len(notes),
+        "note_counts": note_counts,
         "conditions": conditions,
         "plan_record_id": plan_record["id"],
         "manifest_record_id": manifest_record["id"],
@@ -608,6 +893,7 @@ def markdown_view(client, identifier):
     root_record, root = find_experiment(client, identifier)
     plan_record, manifest_record, manifest = current_plan(client, root)
     status = state_for_experiment(client, identifier)
+    notes = experiment_notes(client, identifier)
     lines = [
         f"# {root['title']}",
         "",
@@ -617,12 +903,19 @@ def markdown_view(client, identifier):
         f"Expected cost: `${root['expected_cost_usd']}`  ",
         f"Approved: `{'yes' if status['approved'] else 'no'}`  ",
         f"Coverage: `{status['valid_runs']}/{status['planned_runs']}`",
-        "",
-        "## Authoritative condition matrix",
-        "",
-        "| Order | ID | Runs | Mode | Expected USD/run | Required artifacts | Description |",
-        "|---:|---|---:|---|---:|---|---|",
     ]
+    if notes:
+        lines.extend(["", "## Experiment notes"])
+        lines.extend(note_markdown_entries(notes, heading_level=3))
+    lines.extend(
+        [
+            "",
+            "## Authoritative condition matrix",
+            "",
+            "| Order | ID | Runs | Mode | Expected USD/run | Required artifacts | Description |",
+            "|---:|---|---:|---|---:|---|---|",
+        ]
+    )
     for index, condition in enumerate(manifest["conditions"], start=1):
         artifacts = ", ".join(condition["required_artifacts"]) or "—"
         description = condition["description"].replace("|", "\\|").replace("\n", " ")
@@ -655,7 +948,73 @@ def experiment_view(client, identifier):
         "document": plan_record.get("body", ""),
         "manifest": manifest,
         "status": state_for_experiment(client, identifier),
+        "notes": experiment_notes(client, identifier),
     }
+
+
+def markdown_inline(value):
+    return str(value).replace("\\", "\\\\").replace("`", "\\`")
+
+
+def note_target_label(note):
+    if note["target_type"] == "experiment":
+        return "Experiment"
+    if note["target_type"] == "condition":
+        return f"Condition `{markdown_inline(note['target_id'])}`"
+    return f"Attempt `{markdown_inline(note['target_id'])}`"
+
+
+def note_markdown_entries(notes, heading_level=2):
+    lines = []
+    heading = "#" * heading_level
+    for note in notes:
+        actor = markdown_inline(note["actor"])
+        lines.extend(
+            [
+                "",
+                f"{heading} {note['created_at']} — {actor}",
+                "",
+                f"Target: {note_target_label(note)}  ",
+            ]
+        )
+        if note["topics"]:
+            topics = ", ".join(
+                f"`{markdown_inline(topic['title'])}`" for topic in note["topics"]
+            )
+            lines.append(f"Topics: {topics}  ")
+        lines.extend(["", note["markdown"].rstrip()])
+    return lines
+
+
+def experiment_notes_markdown(client, identifier):
+    _record, root = find_experiment(client, identifier)
+    notes = experiment_notes(client, identifier)
+    lines = [f"# Notes for {root['title']}", ""]
+    if not notes:
+        lines.append("No experiment notes have been recorded.")
+    else:
+        lines.extend(note_markdown_entries(notes))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def experiment_notes_view(client, identifier):
+    _record, root = find_experiment(client, identifier)
+    notes = experiment_notes(client, identifier)
+    return {
+        "ok": True,
+        "experiment_id": root["experiment_id"],
+        "notes": notes,
+        "count": len(notes),
+    }
+
+
+def read_note_markdown(text, path):
+    if text is not None:
+        return text
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as error:
+        invalid("could not read experiment note", {"path": path, "error": str(error)})
 
 
 def render_experiment(client, identifier, output_dir):
@@ -1434,6 +1793,23 @@ def build_parser():
     status.add_argument("id")
     status.add_argument("--json", action="store_true")
 
+    note = commands.add_parser("note")
+    note_commands = note.add_subparsers(dest="note_command", required=True)
+    note_add = note_commands.add_parser("add")
+    note_add.add_argument("id")
+    note_add.add_argument("--actor", required=True)
+    note_content = note_add.add_mutually_exclusive_group(required=True)
+    note_content.add_argument("--text")
+    note_content.add_argument("--file")
+    note_target = note_add.add_mutually_exclusive_group()
+    note_target.add_argument("--condition")
+    note_target.add_argument("--attempt")
+    note_add.add_argument("--topic", action="append", default=[])
+    note_add.add_argument("--operation-key")
+    note_list = note_commands.add_parser("list")
+    note_list.add_argument("id")
+    note_list.add_argument("--format", choices=("json", "markdown"), default="json")
+
     delegate = commands.add_parser("delegate")
     delegate_commands = delegate.add_subparsers(dest="delegate_command", required=True)
     delegate_create = delegate_commands.add_parser("create")
@@ -1496,6 +1872,25 @@ def main(argv=None):
         return 0
     if args.command == "status":
         emit_json(state_for_experiment(client, args.id))
+        return 0
+    if args.command == "note":
+        if args.note_command == "add":
+            emit_json(
+                add_experiment_note(
+                    client,
+                    args.id,
+                    actor=args.actor,
+                    markdown=read_note_markdown(args.text, args.file),
+                    condition_id=args.condition,
+                    attempt_identifier=args.attempt,
+                    topic_identifiers=args.topic,
+                    operation_key=args.operation_key,
+                )
+            )
+        elif args.format == "markdown":
+            sys.stdout.write(experiment_notes_markdown(client, args.id))
+        else:
+            emit_json(experiment_notes_view(client, args.id))
         return 0
     if args.command == "delegate":
         emit_json(create_delegation(client, args))

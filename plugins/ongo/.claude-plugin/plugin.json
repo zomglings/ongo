@@ -1,6 +1,6 @@
 {
   "name": "ongo",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Claude Code research agent, deterministic experiment manager, and encrypted static publisher backed by Ken",
   "author": { "name": "zomglings" },
   "repository": "https://github.com/zomglings/ongo",
