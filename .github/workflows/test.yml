@@ -12,6 +12,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install pinned Ken v3
         run: |
           curl -fsSL https://github.com/zomglings/ken/releases/download/v3/ken-x86_64-linux -o /usr/local/bin/ken
@@ -20,7 +23,9 @@ jobs:
           test "$(ken version)" = 3
       - name: Compile and test
         run: |
+          python3 -m pip install --disable-pip-version-check -r plugins/ongo/requirements.txt
           python3 -m py_compile plugins/ongo/bin/ongo plugins/ongo/lib/ongo/*.py
+          node --check plugins/ongo/lib/ongo/assets/sealed.js
           python3 -m unittest discover -s plugins/ongo/tests -p 'test_*.py' -v
       - name: Validate Claude Code plugin
         run: |

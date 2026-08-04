@@ -26,12 +26,16 @@ The generator:
      URLs (external links get target=_blank rel=noopener), and renders
      `$...$` / `$$...$$` / `\(...\)` / `\[...\]` math via KaTeX vendored
      LOCALLY into site/assets/katex/ (build may fetch once; runtime never).
-  5. Emits a deterministic, self-contained static directory (default ./site/)
-     with an embedded CSS theme and no external runtime assets.
+  5. Emits a self-contained static directory (default ./site/) with an
+     embedded CSS theme and no external runtime assets. Access is resolved per
+     resource: unassigned resources are public and assigned resources are
+     encrypted once for each applicable Ongo access key.
 
-Stdlib only. Safe to run every self-improvement cycle: it rewrites the output
-directory cleanly and produces deterministic output. KaTeX vendoring degrades
-gracefully (raw math, logged to build.log) and never crashes the build.
+Public-only builds are stdlib-only and deterministic. Mixed-access builds use
+the plugin-pinned cryptography package and fresh AES-GCM nonces. Both are safe
+to run every self-improvement cycle: they rewrite the output directory cleanly.
+KaTeX vendoring degrades gracefully (raw math, logged to build.log) and never
+crashes the build.
 
 Usage:
     ongo site build [--ken PATH] [--db PATH] [--out DIR] [--site-title TITLE]
@@ -54,9 +58,10 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+from html.parser import HTMLParser
 from pathlib import Path
 
-from .errors import OngoArgumentParser
+from .errors import OngoArgumentParser, OngoError
 
 
 DEFAULT_KEN = "ken"
@@ -149,19 +154,48 @@ def ken_show_record(ken, db_path, pub_id, key):
         return None
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
-    except (OSError, FileNotFoundError):
-        return None
+    except OSError as error:
+        raise OngoError(
+            "could not read a Ken publication",
+            code="ken-command-failed",
+            exit_code=3,
+            details={"publication_id": pub_id, "error": str(error)},
+        ) from error
     if proc.returncode != 0:
-        return None
+        raise OngoError(
+            "could not read a Ken publication",
+            code="ken-command-failed",
+            exit_code=3,
+            details={
+                "publication_id": pub_id,
+                "returncode": proc.returncode,
+                "stderr": proc.stderr.strip(),
+            },
+        )
     out = (proc.stdout or "").strip()
     if not out:
-        return None
+        raise OngoError(
+            "Ken returned an empty publication record",
+            code="ken-json-invalid",
+            exit_code=3,
+            details={"publication_id": pub_id},
+        )
     try:
         data = json.loads(out)
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as error:
+        raise OngoError(
+            "Ken returned an invalid publication record",
+            code="ken-json-invalid",
+            exit_code=3,
+            details={"publication_id": pub_id, "error": str(error)},
+        ) from error
     if not isinstance(data, dict):
-        return None
+        raise OngoError(
+            "Ken returned an invalid publication record",
+            code="ken-json-invalid",
+            exit_code=3,
+            details={"publication_id": pub_id},
+        )
     return data
 
 
@@ -218,22 +252,66 @@ class KenView:
             self.rows.append(row)
             self.by_id[row["id"]] = row
             if row.get("kind") != "ongo-web" and row.get("key"):
-                self.by_key.setdefault(row["key"], row)
+                self.by_key.setdefault(row["key"], []).append(row)
 
     def publication(self, identifier):
         return self.by_id.get(identifier)
 
     def publication_by_key(self, key):
-        return self.by_key.get(key)
+        matches = self.by_key.get(key, [])
+        if len(matches) > 1:
+            raise OngoError(
+                "Ken publication identifier is ambiguous",
+                code="publication-conflict",
+                exit_code=4,
+                details={"identifier": key, "count": len(matches)},
+            )
+        return matches[0] if matches else None
 
-    def show(self, pub_id):
+    def resolve_publication(self, identifier):
+        matches = {}
+        by_id = self.publication(identifier)
+        if by_id is not None:
+            matches[by_id["id"]] = by_id
+        for row in self.by_key.get(identifier, []):
+            matches[row["id"]] = row
+        if len(matches) > 1:
+            raise OngoError(
+                "Ken publication identifier is ambiguous",
+                code="publication-conflict",
+                exit_code=4,
+                details={"identifier": identifier, "count": len(matches)},
+            )
+        return next(iter(matches.values()), None)
+
+    def show(self, pub_id, *, strict=True):
         if pub_id not in self._shown:
             row = self.by_id.get(pub_id)
-            self._shown[pub_id] = (
-                ken_show_record(self.ken, self.db_path, pub_id, row.get("key") if row else None)
-                if row is not None
-                else None
-            )
+            try:
+                record = (
+                    ken_show_record(
+                        self.ken,
+                        self.db_path,
+                        pub_id,
+                        row.get("key") if row else None,
+                    )
+                    if row is not None
+                    else None
+                )
+            except OngoError:
+                if strict:
+                    raise
+                return None
+            if row is not None and record is None:
+                if strict:
+                    raise OngoError(
+                        "could not read a listed Ken publication",
+                        code="ken-record-unreadable",
+                        exit_code=3,
+                        details={"publication_id": pub_id},
+                    )
+                return None
+            self._shown[pub_id] = record
         return self._shown[pub_id]
 
 
@@ -251,25 +329,32 @@ def fetch_publication_by_key(view, key):
     return view.publication_by_key(key)
 
 
+def resolve_publication_reference(view, identifier):
+    """Resolve an id or key together, rejecting every ambiguous reference."""
+    return view.resolve_publication(identifier)
+
+
 def fetch_digest_body(view, pub_id):
-    """Return the body text for an ``ongo-digest`` publication, or ``""``.
+    """Return a digest body and the note publications it was copied from.
 
     Digests keep their body on a subject-side ``related-to`` note. Ken v3
     returns those relationships and note bodies through ``show --json``.
     """
-    record = view.show(pub_id) or {}
+    record = view.show(pub_id, strict=False) or {}
     bodies = []
+    source_ids = []
     for relation in record.get("relationships", []):
         if relation.get("role") != "subject" or relation.get("relkind") != "related-to":
             continue
         related = view.publication(relation.get("publication"))
         if related is None or related.get("kind") != "note":
             continue
-        shown = view.show(related["id"]) or {}
+        shown = view.show(related["id"], strict=False) or {}
         body = shown.get("body")
         if isinstance(body, str) and body:
             bodies.append(body)
-    return "\n\n".join(bodies).strip()
+            source_ids.append(related["id"])
+    return "\n\n".join(bodies).strip(), source_ids
 
 
 # --------------------------------------------------------------------------- #
@@ -348,7 +433,7 @@ def resolve_source(view, pub, log, ken, db_path):
                 return {"kind": "markdown", "body": fh.read()}
 
     # 3. Ken v3's supported publication body read path.
-    shown = view.show(pub["id"])
+    shown = view.show(pub["id"], strict=False)
     show_body = shown.get("body") if shown else None
     if show_body and show_body.strip():
         return {"kind": "markdown", "body": show_body}
@@ -517,6 +602,7 @@ KATEX_RUNTIME_JS = """\
       }
     }
   }
+  window.__ongoRenderMath=render;
   if(document.readyState==="loading"){
     document.addEventListener("DOMContentLoaded",render);
   }else{
@@ -737,6 +823,170 @@ def _anchor(href, label, external):
     )
 
 
+def safe_link_href(href):
+    """Allow ordinary links while rejecting executable URL schemes."""
+    if not isinstance(href, str) or href != href.strip():
+        return False
+    if re.search(r"[\\\x00-\x20\x7f]", href):
+        return False
+    if href.startswith("//"):
+        return False
+    scheme = re.match(r"^([a-z][a-z0-9+.-]*):", href, re.IGNORECASE)
+    if scheme:
+        return scheme.group(1).lower() in {"http", "https", "mailto"}
+    return True
+
+
+_RAW_HTML_ALLOWED_TAGS = frozenset(
+    {
+        "a", "abbr", "article", "b", "blockquote", "br", "code", "dd",
+        "del", "details", "div", "dl", "dt", "em", "figcaption", "figure",
+        "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i", "img", "kbd",
+        "li", "mark", "nav", "ol", "p", "pre", "s", "section", "small",
+        "span", "strong", "sub", "summary", "sup", "table", "tbody", "td",
+        "tfoot", "th", "thead", "time", "tr", "u", "ul",
+    }
+)
+_RAW_HTML_VOID_TAGS = frozenset(
+    {
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+        "meta", "param", "source", "track", "wbr",
+    }
+)
+_RAW_HTML_DISCARDED_TAGS = frozenset(
+    {
+        "applet", "area", "audio", "base", "button", "col", "embed", "form",
+        "frame", "frameset", "iframe", "input", "link", "math", "meta",
+        "noscript", "object", "option", "param", "script", "select", "source",
+        "style", "svg", "template", "textarea", "track", "video", "wbr",
+    }
+)
+_RAW_HTML_GLOBAL_ATTRIBUTES = frozenset(
+    {"aria-hidden", "aria-label", "class", "id", "role", "title"}
+)
+_RAW_HTML_TAG_ATTRIBUTES = {
+    "a": frozenset({"href", "rel", "target"}),
+    "blockquote": frozenset({"cite"}),
+    "details": frozenset({"open"}),
+    "img": frozenset({"alt", "height", "loading", "src", "width"}),
+    "li": frozenset({"value"}),
+    "ol": frozenset({"reversed", "start"}),
+    "td": frozenset({"colspan", "rowspan"}),
+    "th": frozenset({"colspan", "rowspan", "scope"}),
+    "time": frozenset({"datetime"}),
+}
+_SAFE_DATA_IMAGE = re.compile(
+    r"^data:image/(?:avif|gif|jpeg|png|webp);base64,[A-Za-z0-9+/=]+$",
+    re.IGNORECASE,
+)
+
+
+def safe_media_src(value, allow_remote=True):
+    if _SAFE_DATA_IMAGE.fullmatch(value):
+        return True
+    if not safe_link_href(value):
+        return False
+    scheme = re.match(r"^([a-z][a-z0-9+.-]*):", value, re.IGNORECASE)
+    return scheme is None or (
+        allow_remote and scheme.group(1).lower() in {"http", "https"}
+    )
+
+
+def _sanitize_raw_attributes(tag, attributes, allow_remote_images):
+    allowed = _RAW_HTML_GLOBAL_ATTRIBUTES | _RAW_HTML_TAG_ATTRIBUTES.get(
+        tag, frozenset()
+    )
+    result = []
+    for name, value in attributes:
+        name = name.lower()
+        if name not in allowed:
+            continue
+        value = "" if value is None else value
+        if name in {"href", "cite"} and not safe_link_href(value):
+            continue
+        if name == "src" and not safe_media_src(value, allow_remote_images):
+            continue
+        if name == "target" and value != "_blank":
+            continue
+        if name == "rel":
+            continue
+        if name in {"open", "reversed"}:
+            result.append((name, None))
+        else:
+            result.append((name, value))
+    if tag == "a":
+        has_href = any(name == "href" for name, _value in result)
+        if not has_href:
+            result = [item for item in result if item[0] != "target"]
+        elif any(name == "target" for name, _value in result):
+            result.append(("rel", "noopener noreferrer"))
+    return result
+
+
+class _RawHTMLSanitizer(HTMLParser):
+    def __init__(self, allow_remote_images=True):
+        super().__init__(convert_charrefs=True)
+        self.output = []
+        self.discard_depth = 0
+        self.allow_remote_images = allow_remote_images
+
+    def handle_starttag(self, tag, attributes):
+        tag = tag.lower()
+        if self.discard_depth:
+            if tag not in _RAW_HTML_VOID_TAGS:
+                self.discard_depth += 1
+            return
+        if tag in _RAW_HTML_DISCARDED_TAGS:
+            if tag not in _RAW_HTML_VOID_TAGS:
+                self.discard_depth = 1
+            return
+        if tag not in _RAW_HTML_ALLOWED_TAGS:
+            return
+        rendered = []
+        for name, value in _sanitize_raw_attributes(
+            tag, attributes, self.allow_remote_images
+        ):
+            if value is None:
+                rendered.append(name)
+            else:
+                rendered.append(f'{name}="{html.escape(value, quote=True)}"')
+        suffix = (" " + " ".join(rendered)) if rendered else ""
+        self.output.append(f"<{tag}{suffix}>")
+
+    def handle_startendtag(self, tag, attributes):
+        if self.discard_depth:
+            return
+        lowered = tag.lower()
+        if lowered in _RAW_HTML_DISCARDED_TAGS:
+            return
+        self.handle_starttag(tag, attributes)
+        if (
+            lowered in _RAW_HTML_ALLOWED_TAGS
+            and lowered not in _RAW_HTML_VOID_TAGS
+        ):
+            self.output.append(f"</{lowered}>")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if self.discard_depth:
+            self.discard_depth -= 1
+            return
+        if tag in _RAW_HTML_ALLOWED_TAGS and tag not in _RAW_HTML_VOID_TAGS:
+            self.output.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if not self.discard_depth:
+            self.output.append(html.escape(data))
+
+
+def sanitize_raw_html(value, allow_remote_images=True):
+    """Preserve inert presentation markup while removing executable HTML."""
+    parser = _RawHTMLSanitizer(allow_remote_images=allow_remote_images)
+    parser.feed(value)
+    parser.close()
+    return "".join(parser.output)
+
+
 def _render_inline(text, link_resolver):
     """Render inline markdown within an already-escaped run is wrong; we
     escape here and re-insert safe markup."""
@@ -774,7 +1024,7 @@ def _render_inline(text, link_resolver):
         # `label` came from `text`, which is ALREADY html-escaped (and
         # entity-folded) above. Re-escaping here is the double-escape bug
         # (`&` -> `&amp;` -> `&amp;amp;`). Use the label as-is.
-        if is_plain:
+        if is_plain or not safe_link_href(href):
             # Unpublished target: degrade to plain text, no link, no leak.
             return label
         return _anchor(href, label, _is_external(href))
@@ -812,12 +1062,21 @@ def _render_inline(text, link_resolver):
     return text
 
 
-def markdown_to_html(md, link_resolver, collect_toc=False):
+def markdown_to_html(
+    md,
+    link_resolver,
+    collect_toc=False,
+    allow_raw_html=True,
+    allow_remote_images=True,
+):
     """Convert a useful subset of Markdown to HTML.
 
     Supports: ATX headings, paragraphs, ordered/unordered lists, fenced and
     indented code blocks, blockquotes, horizontal rules, inline code,
-    bold/italic, links, and pass-through of raw HTML blocks.
+    bold/italic, and links. Raw HTML blocks use a presentation-only allowlist;
+    executable elements, event handlers, inline styles, and unsafe URLs are
+    removed. The private ``allow_raw_html`` switch can disable raw HTML, and
+    ``allow_remote_images`` can suppress HTTP(S) images for protected content.
 
     When collect_toc is True, returns (html, toc) where toc is a list of
     (level, anchor_id, text) for every heading (h1-h6), and each emitted
@@ -870,15 +1129,19 @@ def markdown_to_html(md, link_resolver, collect_toc=False):
             )
             continue
 
-        # Pass-through raw HTML block.
-        if _HTML_TAG_LINE.match(line):
+        # Preserve presentation-only raw HTML through the shared sanitizer.
+        if allow_raw_html and _HTML_TAG_LINE.match(line):
             close_list(list_stack)
             buf = [line]
             i += 1
             while i < n and lines[i].strip() != "":
                 buf.append(lines[i])
                 i += 1
-            out.append("\n".join(buf))
+            sanitized = sanitize_raw_html(
+                "\n".join(buf), allow_remote_images=allow_remote_images
+            )
+            if sanitized:
+                out.append(sanitized)
             continue
 
         # Blank line.
@@ -1466,11 +1729,19 @@ def build(args):
     """
     out_dir = os.path.abspath(args.out)
     parent = os.path.dirname(out_dir) or "."
-    work_dir = os.path.join(
-        parent, f".{os.path.basename(out_dir)}.tmp-{os.getpid()}"
+    os.makedirs(parent, exist_ok=True)
+    work_dir = tempfile.mkdtemp(
+        prefix=f".{os.path.basename(out_dir)}.tmp-", dir=parent
+    )
+    # mkdtemp intentionally creates 0700 directories. The completed tree is
+    # static publication output and may be served by a different principal,
+    # so preserve the legacy generator's traversable root mode.
+    os.chmod(work_dir, 0o755)
+    backup_dir = tempfile.mkdtemp(
+        prefix=f".{os.path.basename(out_dir)}.old-", dir=parent
     )
     try:
-        return _build_into(args, out_dir, work_dir)
+        return _build_into(args, out_dir, work_dir, backup_dir)
     finally:
         # Never leave the temp dir behind. On success os.replace already
         # consumed work_dir (this is a no-op); on any exception it cleans
@@ -1478,12 +1749,31 @@ def build(args):
         # failure being propagated.
         if os.path.isdir(work_dir):
             shutil.rmtree(work_dir, ignore_errors=True)
+        # An empty directory is the unused reservation. A nonempty directory
+        # or symlink can be the prior live site after a failed rollback; leave
+        # it in place rather than risking data loss while masking the failure.
+        if os.path.isdir(backup_dir) and not os.path.islink(backup_dir):
+            try:
+                os.rmdir(backup_dir)
+            except OSError:
+                pass
 
 
-def _build_into(args, out_dir, work_dir):
+def _build_into(args, out_dir, work_dir, old_dir):
     ken = resolve_ken(args.ken)
     db_path = resolve_db_path(ken, args.db)
-    old_dir = out_dir + ".old"
+
+    # These trees are recursively removed during staged replacement. Validate
+    # the admin keyring before choosing the legacy or mixed-access renderer so
+    # a public-only build cannot bypass the data-loss guard.
+    from .access import resolve_keyring_path, validate_keyring_location
+
+    validate_keyring_location(
+        resolve_keyring_path(getattr(args, "keyring", None)),
+        output=out_dir,
+        backup=old_dir,
+        staging=work_dir,
+    )
 
     log = []
     log.append(f"ken: {ken}")
@@ -1521,9 +1811,7 @@ def _build_into(args, out_dir, work_dir):
             )
             continue
 
-        pub = fetch_publication(view, ref)
-        if pub is None:
-            pub = fetch_publication_by_key(view, ref)
+        pub = resolve_publication_reference(view, ref)
         if pub is None:
             log.append(
                 f"  WARNING: ongo-web key {ref!r} resolves to no "
@@ -1534,6 +1822,12 @@ def _build_into(args, out_dir, work_dir):
             log.append(
                 f"  WARNING: ongo-web {m['id']} points at another "
                 f"ongo-web marker — skipping"
+            )
+            continue
+        if pub["kind"] == "ongo-access-key":
+            log.append(
+                f"  WARNING: ongo-web {m['id']} points at access-key "
+                "metadata, which is never publishable — skipping"
             )
             continue
         if pub["id"] in items:
@@ -1598,7 +1892,7 @@ def _build_into(args, out_dir, work_dir):
         # but avoids clobbering the marker-driven item).
         if pub["id"] in items:
             continue
-        body = fetch_digest_body(view, pub["id"])
+        body, content_source_ids = fetch_digest_body(view, pub["id"])
         if not body:
             # Fall back to the standard chain, but keep the digest visible
             # even title-only rather than skipping it entirely.
@@ -1632,6 +1926,7 @@ def _build_into(args, out_dir, work_dir):
             "page_path": f"items/{slug}.html",
             "is_digest": True,
             "digest_key": pub["key"] or "",
+            "content_source_ids": content_source_ids,
             "list_rank": pub.get("list_rank", len(view.rows)),
         }
         digest_pub_ids.add(pub["id"])
@@ -1659,6 +1954,22 @@ def _build_into(args, out_dir, work_dir):
         ),
     )
 
+    from .sealed import build_mixed_site, mixed_site_required
+
+    if mixed_site_required(view, global_order):
+        return build_mixed_site(
+            args=args,
+            out_dir=out_dir,
+            old_dir=old_dir,
+            work_dir=work_dir,
+            log=log,
+            view=view,
+            items=items,
+            global_order=global_order,
+            ken=ken,
+            db_path=db_path,
+        )
+
     # Build a published-set lookup for cross-link resolution.
     published_ids = set(items.keys())
 
@@ -1667,9 +1978,7 @@ def _build_into(args, out_dir, work_dir):
 
         def resolver(target):
             # Cross-link to another published note by id/key -> its page.
-            tpub = fetch_publication(view, target)
-            if tpub is None:
-                tpub = fetch_publication_by_key(view, target)
+            tpub = resolve_publication_reference(view, target)
             if tpub is not None and tpub["id"] in published_ids:
                 page = items[tpub["id"]]["page_path"]
                 return (up + page, False)
@@ -1690,8 +1999,6 @@ def _build_into(args, out_dir, work_dir):
     # --- write output (into the temp dir, then atomic swap) ------------- #
     # Start from a clean temp dir (a stale one from a previously killed
     # build with the same pid would otherwise contaminate the output).
-    if os.path.isdir(work_dir):
-        shutil.rmtree(work_dir)
     os.makedirs(os.path.join(work_dir, "items"), exist_ok=True)
 
     # Vendor KaTeX once into assets/katex/ (build-time fetch allowed; the
@@ -1738,9 +2045,7 @@ def _build_into(args, out_dir, work_dir):
                 raw, math_map = extract_math(raw)
             else:
                 math_map = {}
-            html_body, toc = markdown_to_html(
-                raw, resolver, collect_toc=True
-            )
+            html_body, toc = markdown_to_html(raw, resolver, collect_toc=True)
             if math_map:
                 html_body = reinsert_math(html_body, math_map)
                 page_uses_katex = "ongo-math" in html_body
@@ -1966,27 +2271,9 @@ def _build_into(args, out_dir, work_dir):
         fh.write(log_text)
 
     # --- staged replacement with rollback ------------------------------ #
-    # The new tree in work_dir is complete before touching the live path:
-    #   1. drop any stale <out>.old from a prior interrupted swap,
-    #   2. move the current out_dir aside to <out>.old (if it exists),
-    #   3. os.replace(work_dir -> out_dir),
-    #   4. best-effort remove <out>.old.
-    # Each rename is atomic, but the pair is not: readers can see a brief name
-    # gap. A failed second rename rolls the prior tree back into place.
-    if os.path.isdir(old_dir):
-        shutil.rmtree(old_dir)
-    moved_previous = False
-    try:
-        if os.path.exists(out_dir):
-            os.replace(out_dir, old_dir)
-            moved_previous = True
-        os.replace(work_dir, out_dir)
-    except Exception:
-        if moved_previous and not os.path.exists(out_dir) and os.path.exists(old_dir):
-            os.replace(old_dir, out_dir)
-        raise
-    if os.path.isdir(old_dir):
-        shutil.rmtree(old_dir, ignore_errors=True)
+    from .sealed import install_tree
+
+    install_tree(work_dir, out_dir, old_dir)
 
     sys.stdout.write(log_text)
     # Clear, unmissable PASS/FAIL line on stdout (also in build.log via the
@@ -2034,6 +2321,11 @@ def main(argv=None):
         "--base-url",
         default="",
         help="optional base URL (informational; pages use relative links)",
+    )
+    p.add_argument(
+        "--keyring",
+        default=None,
+        help="admin keyring path (then ONGO_SITE_KEYRING, plugin data)",
     )
     args = p.parse_args(argv)
     return build(args)

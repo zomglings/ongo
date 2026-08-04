@@ -57,8 +57,10 @@ Once the first attempt starts, the plan is frozen. A changed protocol is a new
 successor experiment with its own approval.
 
 The generated Ongo site has an Experiments tab. It lists only experiment roots
-with an explicit `ongo-web` marker. Results and artifacts remain private unless
-separately marked.
+with an explicit `ongo-web` marker. Results and artifacts remain absent unless
+separately marked. Each published experiment resource independently remains
+public or is AES-GCM encrypted for its effective `ongo-readable-by` access
+keys; protection never implicitly spreads from a root to an artifact.
 
 ## Pilot interfaces
 

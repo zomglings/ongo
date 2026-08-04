@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import contextlib
 import io
+import importlib.metadata
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 from . import __version__
 from . import arxiv, delete, serve, site, slack
@@ -32,10 +35,143 @@ Commands:
   arxiv sweep           Import the daily arXiv topic sweep
   site build            Build the static Ongo research site
   site serve            Serve a generated site
+  key ...               Manage protected-site symmetric access keys
   ken delete            Delete non-experiment Ken records
   experiment ...        Manage deterministic experiments
   version               Print the Ongo plugin version
 """
+
+
+CRYPTOGRAPHY_VERSION = "49.0.0"
+
+
+def installed_cryptography():
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        del AESGCM
+        version = importlib.metadata.version("cryptography")
+        return {
+            "ok": version == CRYPTOGRAPHY_VERSION,
+            "version": version,
+            "required": CRYPTOGRAPHY_VERSION,
+        }
+    except (ImportError, importlib.metadata.PackageNotFoundError) as error:
+        return {
+            "ok": False,
+            "version": None,
+            "required": CRYPTOGRAPHY_VERSION,
+            "error": str(error),
+        }
+
+
+def _cryptography_probe(target):
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import cryptography, importlib.metadata; "
+            "print(cryptography.__version__); "
+            "print(importlib.metadata.version('cryptography')); "
+            "print(cryptography.__file__)",
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(target)},
+    )
+    probe_lines = probe.stdout.strip().splitlines()
+    valid = (
+        probe.returncode == 0
+        and probe_lines[:2] == [CRYPTOGRAPHY_VERSION, CRYPTOGRAPHY_VERSION]
+        and len(probe_lines) == 3
+        and Path(probe_lines[2]).resolve().is_relative_to(target.resolve())
+    )
+    return valid, probe_lines
+
+
+def install_cryptography():
+    target = default_data_dir() / "python"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    valid, _probe_lines = _cryptography_probe(target)
+    if valid:
+        return {"path": str(target), "version": CRYPTOGRAPHY_VERSION}
+
+    staging = Path(
+        tempfile.mkdtemp(prefix=".python.install-", dir=str(target.parent))
+    )
+    backup = None
+    installed = False
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--no-input",
+                "--target",
+                str(staging),
+                f"cryptography=={CRYPTOGRAPHY_VERSION}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise OngoError(
+                "failed to install the protected-site cryptography dependency",
+                code="cryptography-install-failed",
+                exit_code=3,
+                details={"stderr": result.stderr.strip(), "target": str(target)},
+            )
+        valid, probe_lines = _cryptography_probe(staging)
+        if not valid:
+            raise OngoError(
+                "the installed protected-site dependency failed verification",
+                code="cryptography-install-invalid",
+                exit_code=3,
+                details={"target": str(target), "probe": probe_lines},
+            )
+
+        if os.path.lexists(target):
+            backup = Path(
+                tempfile.mkdtemp(prefix=".python.previous-", dir=str(target.parent))
+            )
+            backup.rmdir()
+            os.replace(target, backup)
+        try:
+            os.replace(staging, target)
+            installed = True
+        except OSError:
+            if backup is not None and os.path.lexists(backup):
+                os.replace(backup, target)
+                backup = None
+            raise
+    except OngoError:
+        raise
+    except OSError as error:
+        raise OngoError(
+            "failed to replace the protected-site dependency atomically",
+            code="cryptography-install-failed",
+            exit_code=3,
+            details={
+                "error": str(error),
+                "target": str(target),
+                "backup": str(backup) if backup is not None else None,
+            },
+        ) from error
+    finally:
+        if os.path.lexists(staging):
+            if staging.is_symlink() or staging.is_file():
+                staging.unlink()
+            else:
+                shutil.rmtree(staging)
+        if installed and backup is not None and os.path.lexists(backup):
+            if backup.is_symlink() or backup.is_file():
+                backup.unlink()
+            else:
+                shutil.rmtree(backup)
+    return {"path": str(target), "version": CRYPTOGRAPHY_VERSION}
 
 
 def invoke(name, function, argv, *, return_code_map=None, passthrough=()):
@@ -82,10 +218,19 @@ def setup_main(argv):
     parser.add_argument("--db")
     args = parser.parse_args(argv)
     binary = install_ken()
+    cryptography = install_cryptography()
     client = KenClient(binary=binary, db=args.db)
     client.initialize()
     client.ensure_kinds()
-    emit_json({"ok": True, "ken": binary, "db": client.db, "version": __version__})
+    emit_json(
+        {
+            "ok": True,
+            "ken": binary,
+            "db": client.db,
+            "cryptography": cryptography,
+            "version": __version__,
+        }
+    )
     return 0
 
 
@@ -119,6 +264,7 @@ def doctor_main(argv):
         "ken": {"ok": False},
         "database": {"ok": False},
         "clacks": clacks_version(),
+        "cryptography": installed_cryptography(),
     }
     data_dir = default_data_dir()
     try:
@@ -185,6 +331,10 @@ def dispatch(argv):
         return invoke("site-build", site.main, rest[1:])
     if command == "site" and rest[:1] == ["serve"]:
         return serve.main(rest[1:])
+    if command == "key":
+        from .access import main as access_main
+
+        return access_main(rest)
     if command == "ken" and rest[:1] == ["delete"]:
         return invoke("ken-delete", delete.main, rest[1:])
     if command == "experiment":

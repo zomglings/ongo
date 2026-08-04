@@ -63,7 +63,11 @@ class SetupAndSiteTests(unittest.TestCase):
             "add", "note", "-k", "existing", "--title", "Existing"
         ).stdout.strip()
 
-        with mock.patch.object(cli, "install_ken", return_value=source), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch.object(cli, "install_ken", return_value=source), mock.patch.object(
+            cli,
+            "install_cryptography",
+            return_value={"path": str(self.data / "python"), "version": "49.0.0"},
+        ), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.setup_main(["--db", str(self.database)]), 0)
             self.assertEqual(cli.setup_main(["--db", str(self.database)]), 0)
 
@@ -77,7 +81,11 @@ class SetupAndSiteTests(unittest.TestCase):
 
     def test_doctor_reports_compatible_database_and_required_kinds(self):
         source = str(self.data / "bin" / "ken")
-        with mock.patch.object(cli, "install_ken", return_value=source), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch.object(cli, "install_ken", return_value=source), mock.patch.object(
+            cli,
+            "install_cryptography",
+            return_value={"path": str(self.data / "python"), "version": "49.0.0"},
+        ), contextlib.redirect_stdout(io.StringIO()):
             cli.setup_main(["--db", str(self.database)])
         output = io.StringIO()
         with mock.patch.object(
@@ -108,6 +116,41 @@ class SetupAndSiteTests(unittest.TestCase):
         with self.assertRaises(OngoError) as raised:
             verify_checksum(candidate, "0" * 64)
         self.assertEqual(raised.exception.code, "ken-checksum-mismatch")
+
+    def test_cryptography_install_replaces_stale_target_atomically(self):
+        target = self.data / "python"
+        stale = target / "cryptography-48.0.1.dist-info"
+        stale.mkdir(parents=True)
+        stale.joinpath("OLD").write_text("stale metadata", encoding="utf-8")
+
+        def fake_run(command, **kwargs):
+            if "pip" in command:
+                install_target = Path(command[command.index("--target") + 1])
+                install_target.joinpath("cryptography").mkdir()
+                install_target.joinpath("cryptography", "__init__.py").write_text(
+                    "", encoding="utf-8"
+                )
+                install_target.joinpath(
+                    "cryptography-49.0.0.dist-info"
+                ).mkdir()
+                return subprocess.CompletedProcess(command, 0, "", "")
+            probe_target = Path(kwargs["env"]["PYTHONPATH"])
+            version = "48.0.1" if probe_target == target else "49.0.0"
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                f"{version}\n{version}\n"
+                f"{probe_target / 'cryptography' / '__init__.py'}\n",
+                "",
+            )
+
+        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run):
+            installed = cli.install_cryptography()
+
+        self.assertEqual(installed["version"], "49.0.0")
+        self.assertFalse(stale.exists())
+        self.assertTrue((target / "cryptography-49.0.0.dist-info").is_dir())
+        self.assertEqual(list(self.data.glob(".python.*-*")), [])
 
     def test_doctor_requires_cursor_capable_clacks(self):
         for version, expected in (("0.14.0", False), ("0.14.1", True)):

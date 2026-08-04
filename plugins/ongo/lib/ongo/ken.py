@@ -42,6 +42,7 @@ PUBLICATION_KINDS = {
     "ongo-experiment-attempt": "One append-only execution attempt for an experiment condition.",
     "ongo-experiment-result": "The terminal result reported for one experiment attempt.",
     "ongo-experiment-artifact": "An immutable text or base64-encoded binary artifact produced by an experiment.",
+    "ongo-access-key": "Public metadata for a symmetric key authorized to decrypt selected Ongo site resources; secret material is never stored in Ken.",
 }
 
 RELATIONSHIP_KINDS = {
@@ -56,6 +57,7 @@ RELATIONSHIP_KINDS = {
     "ongo-result-of": "Connects a terminal result to its attempt.",
     "ongo-produced": "Connects an experiment result to an immutable artifact.",
     "ongo-successor-of": "Connects a changed protocol to the experiment it supersedes.",
+    "ongo-readable-by": "Authorizes an Ongo site resource to be encrypted for an access-key descriptor.",
 }
 
 
