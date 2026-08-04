@@ -1,10 +1,10 @@
 ---
 name: ongo
 description: >-
-  Research agent and deterministic experiment-management toolkit. Use for
-  planning, approving, executing, or verifying experiments through the Ongo
-  CLI; also polls Slack, tracks findings in Ken, expands research when idle,
-  and self-improves on a 24-hour cycle.
+  Research agent, deterministic experiment-management toolkit, and encrypted
+  static publisher. Use for planning, approving, executing, or verifying
+  experiments; managing public or symmetric-key-protected Ongo content; polling
+  Slack; tracking findings in Ken; autonomous expansion; and self-improvement.
 args: "[--channel <channel_id>] [--interval <minutes>] [--idle]"
 ---
 
@@ -37,7 +37,8 @@ ongo doctor --json
 KEN=$(printf '%s' "$SETUP" | jq -r '.ken')
 ```
 
-`ongo setup` installs the checksum-pinned Ken v3 platform binary under
+`ongo setup` installs the checksum-pinned Ken v3 platform binary and pinned
+`cryptography` build dependency under
 `${CLAUDE_PLUGIN_DATA}`, initializes the selected database, and idempotently
 registers every publication and relationship kind Ongo requires. If either
 command fails, show its structured error and halt.
@@ -486,7 +487,7 @@ Every 24h or on request. Five layers, all run together:
 - **Importance** — topic centrality by connection count
 - **Kind evolution** — new `pubkind` if needed
 - **Stale directives** — review `ongo-exploration`, flag outdated on Slack. Use `ongo ken delete pub --kind ongo-exploration` (with `--dry-run` first) to remove directives that are no longer relevant, or `ongo ken delete pub <id>` to remove individual stale entries.
-- **Regenerate the published site** — run `ongo site build` to rebuild the static site from the `ongo-web` publish set. It is idempotent, deterministic, and rewrites the output dir cleanly, so it is safe to run every cycle. Hosting is self-served (`ongo site serve`) on the user's own server; **DNS is the user's manual step — ongo never performs DNS or deploys.**
+- **Regenerate the published site** — run `ongo site build` to rebuild the static site from the `ongo-web` publish set. Access is resolved per resource: unassigned resources stay public and resources with effective `ongo-readable-by` keys are encrypted. Public-only builds remain deterministic; builds containing protected resources use fresh nonces. Both rewrite the output dir cleanly. Hosting is self-served (`ongo site serve`) on the user's own server; **DNS is the user's manual step — ongo never performs DNS or deploys.**
 
 ### B. Dependency updates
 
@@ -579,8 +580,11 @@ $KEN add ongo-web -k "<note-id>" --title "<nav title>"
 `ongo site build` generates a self-contained static site
 (default `./site/`) from the publish set: a reverse-chronological index,
 plus per-item HTML pages with an embedded CSS
-theme and no external assets. It is stdlib-only, idempotent, and
-deterministic — it **regenerates each self-improvement cycle** (see
+theme and no external assets. A public-only build is stdlib-only, idempotent,
+and deterministic. A build containing protected resources uses the pinned
+`cryptography` dependency installed by `ongo setup` and fresh AES-GCM nonces;
+it remains idempotent in meaning but is intentionally not byte-deterministic.
+The site **regenerates each self-improvement cycle** (see
 Self-Improvement layer A). Source bodies resolve in order: a filesystem
 `.md`/`.pdf`/`.tex` named by the publication key, a slug match under the
 note roots, the kendb note body read via `ken show --json` (**Ken v3**,
@@ -593,12 +597,73 @@ The **Experiments** tab contains only experiment roots with their own explicit
 Attempts, results, and artifacts do not inherit that marker; each artifact
 requires its own `ongo-web` marker before it can appear anywhere on the site.
 
+### Per-resource protected publishing
+
+Protection belongs to a published resource, not to the site as a whole. The
+same generated site may contain public notes, protected notes, public
+experiments, and protected experiments. An `ongo-readable-by` relationship
+from a resource to an `ongo-access-key` descriptor makes that resource
+available under the corresponding symmetric key. Several relationships create
+several AES-256-GCM ciphertext variants under one resource identity; the
+browser displays the resource once and reports every locally named key that
+unlocked it. Key descriptors and policy live in Ken; secret material never
+does.
+
+Manage administrator keys only through the CLI:
+
+```bash
+ongo key create --label "Work" --scope all       # all current/future content
+ongo key create --label "Snapshot" --scope published
+ongo key create --label "Project" --scope empty
+printf '%s\n' "$ONGO_SHARED_CAPABILITY" | ongo key import --label "Imported" --scope empty
+ongo key grant <key-id> <publication-id>
+ongo key list
+ongo key export <key-id>
+```
+
+`key import` reads the capability from standard input or a hidden interactive
+prompt. Never place literal capability material in command arguments or shell
+history.
+
+`--scope published` materializes grants for the current `ongo-web` targets and
+digests. `--scope empty` protects only resources granted later. `--scope all`
+is an effective default for every current and future published resource. If a
+resource has no effective key, it retains the existing public behavior.
+Digest bodies are derived from related notes. When a related source note is
+protected, grant the digest a non-broader subset of the source's keys; site
+generation rejects incompatible policies rather than exposing the copied body.
+
+The browser's **Keys** panel accepts the capability returned by `key create` or
+`key export`, lets the reader choose a local label, and stores the capability
+in browser local storage. Titles, bodies, dates, tags, experiment protocols,
+and artifacts for protected resources exist in the static output only inside
+AES-GCM ciphertext. The client tries registered keys, displays inaccessible
+resources as generic encrypted entries, and deduplicates successful variants.
+Never put a capability in Ken, Slack, a URL, generated output, or an Ongo log.
+The administrator keyring may be reached through symlinks but must not be
+hard-linked; the CLI rejects hard links to preserve atomic keyring updates.
+If browser storage is blocked, entered keys remain in memory for the current
+page session. Public resources still render without storage or Web Crypto.
+Public resources may retain remote HTTP(S) images. The builder removes remote
+images from protected resources so successful decryption cannot reveal access
+to a third-party image host; use relative or embedded data images instead.
+
+Protected resources require HTTPS in production because Web Crypto is a secure-
+context API. Build on a trusted machine and deploy only the generated static
+tree. A recipient can retain plaintext or a capability; static hosting cannot
+enforce expiration or revoke already downloaded ciphertext. A compromised
+host can replace the JavaScript and steal keys when a reader unlocks content.
+The generated manifest intentionally leaks resource count, article/experiment
+collection, ordering, stable opaque IDs, ciphertext sizes, and rebuild timing;
+it does not expose protected titles, dates, tags, bodies, or key labels.
+
 **Regeneration is staged and recoverable.** The generator builds a complete
-tree in a sibling temp directory, moves the prior tree aside, and renames the
-new tree into place. If the second rename fails, it restores the prior tree.
-No half-written tree is served, though a request in the very small interval
-between the two directory renames may receive a transient miss. The long-lived
-`ongo site serve` process does not need a restart after regeneration.
+tree in a uniquely reserved sibling temp directory, moves the prior tree into
+a separately reserved sibling backup, and renames the new tree into place. If
+the second rename fails, it restores the prior tree. No half-written tree is
+served, though a request in the very small interval between the two directory
+renames may receive a transient miss. The long-lived `ongo site serve` process
+does not need a restart after regeneration.
 
 `ongo site serve` serves the generated directory via
 `python3 -m http.server` (default `0.0.0.0:80`). Hosting is

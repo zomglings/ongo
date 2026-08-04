@@ -1,7 +1,8 @@
 # ongo-site — publishing, generating, serving
 
 `ongo site build` turns the **kendb publish set** into a self-contained static
-website. Research notes, experiments, results, and artifacts require an
+website with access resolved per resource. Research notes, experiments,
+results, and artifacts require an
 explicit `ongo-web` marker. Daily `ongo-digest` publications are the one
 automatic collection.
 
@@ -54,8 +55,9 @@ ongo site build --out /opt/ongo/site   # custom output directory
 ongo site build --ken /path/to/ken --db /path/to/ken.db
 ```
 
-The generator is stdlib-only, idempotent, and rewrites the output directory
-cleanly — it is safe to run every self-improvement cycle. Source bodies are
+Public-only generation is stdlib-only and deterministic. Every build is
+idempotent in meaning and rewrites the output directory cleanly, so it is safe
+to run every self-improvement cycle. Source bodies are
 resolved from (in order) a filesystem `.md`/`.pdf`/`.tex` named by the
 publication key, a slug match under the note roots, the kendb note body via
 `ken show --json` (the supported **Ken v3** read path), or finally the title.
@@ -63,13 +65,31 @@ Unresolvable references are skipped with a
 warning in `site/build.log` (the build never crashes). Cross-links between published
 notes resolve to their generated pages; links to **unpublished** notes
 degrade to plain text so unpublished content is never leaked.
+Presentation-oriented raw HTML is sanitized through a shared allowlist in
+public and mixed builds; executable elements, event handlers, inline styles,
+and unsafe URLs are removed.
+Remote HTTP(S) images remain available in public resources but are stripped
+from protected resources to avoid access-dependent requests to third parties.
+Use relative or embedded data images for protected content.
+
+When any published resource has an effective access key, the generator uses
+the pinned `cryptography` dependency installed by `ongo setup` and emits a
+mixed static client. Resources without keys remain plaintext; resources with
+keys are AES-256-GCM encrypted independently for every assigned key. Such
+builds use fresh nonces and therefore are not byte-deterministic. Configure
+keys with `ongo key create`, `ongo key grant`, and `ongo key export`; see the
+repository README for scope semantics. The administrator keyring must never be
+placed inside the generated site directory or hard-linked. A protected note
+used as a digest body also requires the digest to have a non-broader compatible
+key set; incompatible derived-content policy fails the build closed.
 
 **Regeneration is staged and recoverable.** `ongo site build` prepares a
-complete sibling tree, moves the previous tree aside, then renames the new tree
-into place. A failed second rename restores the previous tree. The server never
-sees a half-written tree, although a request in the tiny interval between the
-two renames may receive a transient miss. The running `ongo site serve`
-process does not need to be restarted.
+complete tree and reserves a uniquely named backup in the output's parent,
+moves the previous tree aside, then renames the new tree into place. A failed
+second rename restores the previous tree. The server never sees a half-written
+tree, although a request in the tiny interval between the two renames may
+receive a transient miss. The running `ongo site serve` process does not need
+to be restarted.
 
 ## 3. Serve the site
 
@@ -88,7 +108,9 @@ For production, run it under systemd:
   capabilities before exec) — so the service binds :80 **without running
   as full root**. No reverse proxy is required for plain HTTP.
 
-A reverse proxy is now **optional** — only needed if you also want HTTPS
+A reverse proxy is optional for a public-only site. It is **required for a site
+containing protected resources**, because browser Web Crypto requires HTTPS
+(localhost is the development exception). Use it if you want HTTPS
 on :443. If so, terminate TLS in nginx/caddy and proxy to the `ongo site serve`
 backend (point it at a high local port instead of :80 in that case).
 
@@ -137,6 +159,15 @@ the user owns DNS and the server.
 ## Auto-regeneration (optional)
 
 `ongo-site-regen.service` + `ongo-site-regen.timer` regenerate the site every 15 min so new kendb `ongo-web` markers and topic/relationship edges publish automatically. Install both unit files (see the service file header), then `systemctl enable --now ongo-site-regen.timer`. The staged replacement means `ongo-site.service` needs no restart.
+
+For protected resources, the regeneration user must be able to read the admin
+keyring under `ONGO_DATA_DIR` (default `site-keys.json`, mode `0600`). The
+serving process needs only the generated directory and should not receive the
+keyring or Ken database. Prefer building on a trusted machine and copying only
+the completed static tree to the public host. The public tree still reveals
+resource counts, collection membership, ordering, stable opaque IDs,
+ciphertext sizes, and rebuild timing; protected semantic fields remain inside
+the ciphertext envelopes.
 
 Version 0.4.0 replaces the former skill-local `ongo-site` and `ongo-serve`
 paths. Existing installed systemd units must be replaced manually. This command
