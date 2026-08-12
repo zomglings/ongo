@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .errors import OngoError
@@ -116,6 +117,119 @@ def _legacy_int(value, default=0) -> int:
         return default
 
 
+def _validate_legacy_loop_state(payload: dict, path: Path) -> tuple[str, str, Decimal]:
+    channel = payload.get("channel")
+    cursor = payload.get("last_user_ts")
+    if not isinstance(channel, str) or not channel.strip() or cursor is None:
+        raise OngoError(
+            "legacy Ongo state is missing valid loop fields",
+            code="legacy-state-invalid",
+            exit_code=3,
+            details={"path": str(path)},
+        )
+    cursor_text = str(cursor).strip()
+    try:
+        cursor_value = Decimal(cursor_text)
+    except (InvalidOperation, ValueError):
+        cursor_value = Decimal("NaN")
+    if not cursor_text or not cursor_value.is_finite():
+        raise OngoError(
+            "legacy Ongo state has an invalid Slack cursor",
+            code="legacy-state-invalid",
+            exit_code=3,
+            details={"path": str(path), "last_user_ts": cursor_text},
+        )
+    return channel.strip(), cursor_text, cursor_value
+
+
+def _merge_live_legacy_state(
+    target_payload: dict,
+    legacy_payload: dict,
+    *,
+    target: Path,
+    legacy: Path,
+    include_scheduler: bool,
+) -> tuple[dict, bool]:
+    """Merge progress committed by a legacy tick before tombstoning it."""
+    legacy_channel, legacy_cursor, legacy_cursor_value = _validate_legacy_loop_state(
+        legacy_payload, legacy
+    )
+    target_channel = target_payload.get("channel")
+    try:
+        target_cursor_value = Decimal(str(target_payload.get("last_user_ts", "")))
+    except (InvalidOperation, ValueError):
+        target_cursor_value = Decimal("NaN")
+    if (
+        not isinstance(target_channel, str)
+        or not target_channel.strip()
+        or not target_cursor_value.is_finite()
+    ):
+        raise OngoError(
+            "migrated Ongo state has invalid loop fields",
+            code="legacy-state-migration-failed",
+            exit_code=3,
+            details={"from": str(legacy), "to": str(target)},
+        )
+    if target_channel.strip() != legacy_channel:
+        raise OngoError(
+            "legacy Ongo state changed channels during migration",
+            code="legacy-state-migration-conflict",
+            exit_code=3,
+            details={
+                "from": str(legacy),
+                "to": str(target),
+                "target_channel": target_channel,
+                "legacy_channel": legacy_channel,
+            },
+        )
+    if legacy_cursor_value < target_cursor_value:
+        return target_payload, False
+
+    merged = dict(target_payload)
+    merged["channel"] = legacy_channel
+    merged["last_user_ts"] = legacy_cursor
+    for field in ("last_self_improve", "last_arxiv_daily"):
+        merged[field] = max(
+            _legacy_int(merged.get(field)), _legacy_int(legacy_payload.get(field))
+        )
+    for field in ("rotation", "ken"):
+        if legacy_payload.get(field) is not None:
+            merged[field] = legacy_payload[field]
+    if "idle" in legacy_payload:
+        merged["idle"] = bool(legacy_payload["idle"])
+
+    if include_scheduler:
+        scheduler = dict(merged.get("scheduler") or {})
+        scheduler_id = legacy_payload.get("cron_id") or scheduler.get("id")
+        normal_cron = (
+            str(legacy_payload.get("normal_cron") or "").strip()
+            or scheduler.get("normal_cron")
+            or "7,37 * * * *"
+        )
+        scheduler.update(
+            {
+                "host": "claude",
+                "id": scheduler_id,
+                "previous_id": legacy_payload.get("prev_cron_id")
+                or scheduler.get("previous_id"),
+                "created": _legacy_int(
+                    legacy_payload.get("cron_created"),
+                    _legacy_int(scheduler.get("created")),
+                ),
+                "normal_interval_minutes": _normal_interval_minutes(normal_cron),
+                "normal_cron": normal_cron,
+                "mode": legacy_payload.get("mode", scheduler.get("mode", "normal")),
+                "fast_idle_polls": _legacy_int(
+                    legacy_payload.get("fast_idle_polls"),
+                    _legacy_int(scheduler.get("fast_idle_polls")),
+                ),
+                "needs_prompt_upgrade": bool(scheduler_id),
+            }
+        )
+        merged["scheduler"] = scheduler
+    return merged, merged != target_payload
+
+
 def _tombstone_payload(target: Path, scheduler_id, migrated_at: int) -> dict:
     return {
         "schema": LEGACY_TOMBSTONE_SCHEMA,
@@ -143,11 +257,24 @@ def _recover_interrupted_migration(target: Path, legacy: Path, now=None):
     if old.get("schema") == LEGACY_TOMBSTONE_SCHEMA:
         return None
     scheduler = target_payload.get("scheduler")
+    if isinstance(scheduler, dict) and scheduler.get("needs_prompt_upgrade") is False:
+        return None
     scheduler_id = scheduler.get("id") if isinstance(scheduler, dict) else None
     migrated_at = _legacy_int(
         record.get("migrated_at"), int(time.time() if now is None else now)
     )
     try:
+        target_payload, changed = _merge_live_legacy_state(
+            target_payload,
+            old,
+            target=target,
+            legacy=legacy,
+            include_scheduler=True,
+        )
+        if changed:
+            _atomic_json(target, target_payload)
+        scheduler = target_payload.get("scheduler")
+        scheduler_id = scheduler.get("id") if isinstance(scheduler, dict) else None
         _atomic_json(legacy, _tombstone_payload(target, scheduler_id, migrated_at))
     except OSError as error:
         raise OngoError(
@@ -181,21 +308,15 @@ def migrate_legacy_agent_state(target: Path, *, legacy: Path | None = None, now=
     old = _read_json(legacy)
     if old.get("schema") == LEGACY_TOMBSTONE_SCHEMA:
         return {"status": "tombstone", "from": str(legacy), "to": str(target)}
-    if "channel" not in old or "last_user_ts" not in old:
-        raise OngoError(
-            "legacy Ongo state is missing required loop fields",
-            code="legacy-state-invalid",
-            exit_code=3,
-            details={"path": str(legacy)},
-        )
+    channel, last_user_ts, _cursor_value = _validate_legacy_loop_state(old, legacy)
 
     scheduler_id = old.get("cron_id") or None
     previous_id = old.get("prev_cron_id") or None
     normal_cron = str(old.get("normal_cron") or "").strip() or "7,37 * * * *"
     migrated_at = int(time.time() if now is None else now)
     migrated = {
-        "channel": old["channel"],
-        "last_user_ts": old["last_user_ts"],
+        "channel": channel,
+        "last_user_ts": last_user_ts,
         "last_self_improve": _legacy_int(old.get("last_self_improve")),
         "last_arxiv_daily": _legacy_int(old.get("last_arxiv_daily")),
         "rotation": old.get("rotation", "reference"),
@@ -224,8 +345,25 @@ def migrate_legacy_agent_state(target: Path, *, legacy: Path | None = None, now=
     try:
         _atomic_json(target, migrated)
         target_written = True
+        latest = _read_json(legacy)
+        if latest.get("schema") != LEGACY_TOMBSTONE_SCHEMA:
+            migrated, changed = _merge_live_legacy_state(
+                migrated,
+                latest,
+                target=target,
+                legacy=legacy,
+                include_scheduler=True,
+            )
+            if changed:
+                _atomic_json(target, migrated)
+            scheduler_id = migrated["scheduler"]["id"]
         _atomic_json(legacy, _tombstone_payload(target, scheduler_id, migrated_at))
     except OngoError:
+        if target_written:
+            try:
+                target.unlink()
+            except OSError:
+                pass
         raise
     except OSError as error:
         rollback_error = None

@@ -132,12 +132,17 @@ class StateMigrationTests(unittest.TestCase):
         self.target.write_text(
             json.dumps(
                 {
+                    "channel": "C123",
+                    "last_user_ts": "1.0",
                     "migration": {
                         "schema": MIGRATION_RECORD_SCHEMA,
                         "from": str(self.legacy),
                         "migrated_at": 41,
                     },
-                    "scheduler": {"id": "cron-current"},
+                    "scheduler": {
+                        "id": "cron-current",
+                        "needs_prompt_upgrade": True,
+                    },
                 }
             ),
             encoding="utf-8",
@@ -151,6 +156,83 @@ class StateMigrationTests(unittest.TestCase):
         tombstone = json.loads(self.legacy.read_text(encoding="utf-8"))
         self.assertEqual(tombstone["schema"], LEGACY_TOMBSTONE_SCHEMA)
         self.assertEqual(tombstone["scheduler_id"], "cron-current")
+
+    def test_recovery_merges_newer_legacy_cursor_before_tombstoning(self):
+        self.target.parent.mkdir(parents=True)
+        self.target.write_text(
+            json.dumps(
+                {
+                    "channel": "C123",
+                    "last_user_ts": "1000.0",
+                    "migration": {
+                        "schema": MIGRATION_RECORD_SCHEMA,
+                        "from": str(self.legacy),
+                        "migrated_at": 41,
+                    },
+                    "scheduler": {
+                        "id": "cron-old",
+                        "needs_prompt_upgrade": True,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.legacy.write_text(
+            json.dumps(
+                {
+                    "channel": "C123",
+                    "last_user_ts": "2000.0",
+                    "cron_id": "cron-new",
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = migrate_legacy_agent_state(self.target, legacy=self.legacy)
+        self.assertTrue(result["recovered"])
+        migrated = json.loads(self.target.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["last_user_ts"], "2000.0")
+        self.assertEqual(migrated["scheduler"]["id"], "cron-new")
+        self.assertEqual(
+            json.loads(self.legacy.read_text(encoding="utf-8"))["schema"],
+            LEGACY_TOMBSTONE_SCHEMA,
+        )
+
+    def test_happy_path_rereads_cursor_before_tombstoning(self):
+        self.legacy.write_text(
+            '{"channel":"C123","last_user_ts":"1000.0"}\n', encoding="utf-8"
+        )
+        atomic_json = state_module._atomic_json
+        injected = False
+
+        def advance_legacy(path, payload):
+            nonlocal injected
+            if Path(path) == self.target and not injected:
+                injected = True
+                atomic_json(
+                    self.legacy,
+                    {"channel": "C123", "last_user_ts": "2000.0"},
+                )
+            atomic_json(path, payload)
+
+        with mock.patch.object(state_module, "_atomic_json", side_effect=advance_legacy):
+            migrate_legacy_agent_state(self.target, legacy=self.legacy)
+        migrated = json.loads(self.target.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["last_user_ts"], "2000.0")
+
+    def test_empty_legacy_loop_fields_are_rejected(self):
+        invalid_payloads = (
+            {"channel": None, "last_user_ts": "1.0"},
+            {"channel": "  ", "last_user_ts": "1.0"},
+            {"channel": "C123", "last_user_ts": ""},
+            {"channel": "C123", "last_user_ts": "not-a-timestamp"},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                self.legacy.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(OngoError) as raised:
+                    migrate_legacy_agent_state(self.target, legacy=self.legacy)
+                self.assertEqual(raised.exception.code, "legacy-state-invalid")
+                self.assertFalse(self.target.exists())
 
     def test_existing_new_state_is_never_overwritten(self):
         self.target.parent.mkdir(parents=True)

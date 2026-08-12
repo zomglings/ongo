@@ -142,6 +142,39 @@ class SetupAndSiteTests(unittest.TestCase):
         self.assertEqual(payload["state"], str(self.data / "agent-state.json"))
         self.assertEqual(payload["state_migration"]["status"], "none")
 
+    def test_setup_reports_invalid_legacy_state_without_failing_install(self):
+        source = str(self.data / "bin" / "ken")
+        legacy = self.root / "legacy-state.json"
+        legacy.write_text('{"unrelated":true}\n', encoding="utf-8")
+        output = io.StringIO()
+        with mock.patch.object(cli, "install_ken", return_value=source), mock.patch.object(
+            cli,
+            "install_cryptography",
+            return_value={"path": str(self.data / "python"), "version": "49.0.0"},
+        ), contextlib.redirect_stdout(output):
+            self.assertEqual(cli.setup_main(["--db", str(self.database)]), 0)
+        payload = json.loads(output.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["state_migration"]["status"], "invalid")
+        self.assertEqual(payload["state_migration"]["from"], str(legacy))
+        self.assertFalse((self.data / "agent-state.json").exists())
+        self.assertEqual(json.loads(legacy.read_text(encoding="utf-8")), {"unrelated": True})
+
+    def test_setup_reports_malformed_legacy_json_without_failing_install(self):
+        source = str(self.data / "bin" / "ken")
+        legacy = self.root / "legacy-state.json"
+        legacy.write_text("{unfinished\n", encoding="utf-8")
+        output = io.StringIO()
+        with mock.patch.object(cli, "install_ken", return_value=source), mock.patch.object(
+            cli,
+            "install_cryptography",
+            return_value={"path": str(self.data / "python"), "version": "49.0.0"},
+        ), contextlib.redirect_stdout(output):
+            self.assertEqual(cli.setup_main(["--db", str(self.database)]), 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["state_migration"]["status"], "invalid")
+        self.assertEqual(legacy.read_text(encoding="utf-8"), "{unfinished\n")
+
     def test_doctor_reports_compatible_database_and_required_kinds(self):
         source = str(self.data / "bin" / "ken")
         with mock.patch.object(cli, "install_ken", return_value=source), mock.patch.object(

@@ -227,7 +227,17 @@ def setup_main(argv):
     client.initialize()
     client.ensure_kinds()
     state = agent_state_path()
-    state_migration = migrate_legacy_agent_state(state)
+    try:
+        state_migration = migrate_legacy_agent_state(state)
+    except OngoError as error:
+        if error.code != "legacy-state-invalid":
+            raise
+        state_migration = {
+            "status": "invalid",
+            "from": error.details.get("path"),
+            "to": str(state),
+            "error": str(error),
+        }
     emit_json(
         {
             "ok": True,

@@ -62,6 +62,12 @@ STATE_PATH=$(printf '%s' "$SETUP" | jq -r '.state')
 STATE_MIGRATION=$(printf '%s' "$SETUP" | jq -r '.state_migration.status')
 ```
 
+If `STATE_MIGRATION` is `invalid`, setup of the CLI and research database still
+succeeded, but recurring-loop startup must stop. Report the legacy path and
+error from `state_migration`; ask the user to inspect and move or remove that
+file after confirming no 0.5.x loop still needs it. Never overwrite, delete, or
+silently ignore invalid legacy state.
+
 For a Slack loop, run `"$ONGO" doctor --json`. For one-shot experiment,
 publishing, or Ken work that does not use Slack, run
 `"$ONGO" doctor --json --no-slack`. Verify every reported check.

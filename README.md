@@ -45,6 +45,11 @@ legacy cron with a new-state prompt using create-before-delete and sweeps any
 older Ongo tick jobs. Do not manually start a second loop while that one-time
 migration is being reconciled.
 
+If the legacy path contains corrupt or unrelated data, setup reports
+`state_migration.status: invalid` without blocking one-shot CLI use. Recurring
+startup remains blocked until the user inspects that path, confirms no legacy
+loop needs it, and moves or removes it.
+
 ## Usage
 
 ```
