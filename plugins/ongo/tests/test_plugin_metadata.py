@@ -81,7 +81,7 @@ class PluginMetadataTests(unittest.TestCase):
             )
         self.assertEqual(result.stdout.strip(), __version__)
 
-    def test_entrypoint_uses_codex_plugin_data(self):
+    def test_entrypoint_preserves_claude_data_when_both_hosts_are_present(self):
         entrypoint = runpy.run_path(str(PLUGIN_ROOT / "bin" / "ongo"))
         with mock.patch.dict(
             os.environ,
@@ -92,8 +92,20 @@ class PluginMetadataTests(unittest.TestCase):
             clear=True,
         ):
             self.assertEqual(
-                entrypoint["plugin_data_dir"](), "/tmp/codex-ongo-data"
+                entrypoint["plugin_data_dir"](), "/tmp/claude-ongo-data"
             )
+
+    def test_entrypoint_uses_codex_data_and_ignores_whitespace(self):
+        entrypoint = runpy.run_path(str(PLUGIN_ROOT / "bin" / "ongo"))
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CLAUDE_PLUGIN_DATA": "  ",
+                "PLUGIN_DATA": "/tmp/codex-ongo-data",
+            },
+            clear=True,
+        ):
+            self.assertEqual(entrypoint["plugin_data_dir"](), "/tmp/codex-ongo-data")
 
     def test_memory_probe_is_portable_and_machine_readable(self):
         probe = PLUGIN_ROOT / "skills" / "ongo" / "scripts" / "available-memory-mib"

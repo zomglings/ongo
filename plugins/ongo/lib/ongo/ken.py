@@ -64,11 +64,11 @@ RELATIONSHIP_KINDS = {
 
 
 def default_data_dir():
-    for variable in ("ONGO_DATA_DIR", "PLUGIN_DATA", "CLAUDE_PLUGIN_DATA"):
-        configured = os.environ.get(variable)
+    for variable in ("ONGO_DATA_DIR", "CLAUDE_PLUGIN_DATA", "PLUGIN_DATA"):
+        configured = (os.environ.get(variable) or "").strip()
         if configured:
             return Path(configured).expanduser()
-    xdg = os.environ.get("XDG_DATA_HOME")
+    xdg = (os.environ.get("XDG_DATA_HOME") or "").strip()
     if xdg:
         return Path(xdg).expanduser() / "ongo"
     return Path.home() / ".local" / "share" / "ongo"

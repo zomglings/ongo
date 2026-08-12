@@ -68,7 +68,7 @@ publishing, or Ken work that does not use Slack, run
 
 `ongo setup` installs checksum-pinned Ken v3 and the pinned `cryptography`
 dependency in Ongo's writable data directory. Data-directory precedence is
-`ONGO_DATA_DIR`, `PLUGIN_DATA`, `CLAUDE_PLUGIN_DATA`, `XDG_DATA_HOME/ongo`, then
+`ONGO_DATA_DIR`, `CLAUDE_PLUGIN_DATA`, `PLUGIN_DATA`, `XDG_DATA_HOME/ongo`, then
 `~/.local/share/ongo`.
 
 For a Slack loop, send the startup message to the requested channel or discover

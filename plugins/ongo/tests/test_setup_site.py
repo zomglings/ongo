@@ -34,7 +34,7 @@ from ongo.ken import (
 
 
 class RuntimePathTests(unittest.TestCase):
-    def test_codex_plugin_data_precedes_claude_compatibility_data(self):
+    def test_claude_data_is_preserved_when_codex_variable_is_also_present(self):
         with mock.patch.dict(
             os.environ,
             {
@@ -43,10 +43,29 @@ class RuntimePathTests(unittest.TestCase):
             },
             clear=True,
         ):
-            self.assertEqual(default_data_dir(), Path("/tmp/codex-ongo-data"))
+            self.assertEqual(default_data_dir(), Path("/tmp/claude-ongo-data"))
             self.assertEqual(
-                agent_state_path(), Path("/tmp/codex-ongo-data/agent-state.json")
+                agent_state_path(), Path("/tmp/claude-ongo-data/agent-state.json")
             )
+
+    def test_codex_plugin_data_is_used_without_claude_data(self):
+        with mock.patch.dict(
+            os.environ, {"PLUGIN_DATA": "/tmp/codex-ongo-data"}, clear=True
+        ):
+            self.assertEqual(default_data_dir(), Path("/tmp/codex-ongo-data"))
+
+    def test_whitespace_environment_values_are_ignored(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ONGO_DATA_DIR": " ",
+                "CLAUDE_PLUGIN_DATA": "\t",
+                "PLUGIN_DATA": "  ",
+                "XDG_DATA_HOME": "/tmp/xdg-data",
+            },
+            clear=True,
+        ):
+            self.assertEqual(default_data_dir(), Path("/tmp/xdg-data/ongo"))
 
     def test_explicit_ongo_data_precedes_host_data(self):
         with mock.patch.dict(
