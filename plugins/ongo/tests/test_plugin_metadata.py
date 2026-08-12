@@ -9,6 +9,7 @@ import re
 import runpy
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -68,6 +69,16 @@ class PluginMetadataTests(unittest.TestCase):
         result = subprocess.run(
             [str(wrapper), "version"], capture_output=True, text=True, check=True
         )
+        self.assertEqual(result.stdout.strip(), __version__)
+
+    def test_runtime_wrapper_resolves_symlink_before_finding_plugin(self):
+        wrapper = PLUGIN_ROOT / "skills" / "ongo" / "scripts" / "ongo"
+        with tempfile.TemporaryDirectory() as temporary:
+            link = Path(temporary) / "ongo"
+            link.symlink_to(wrapper)
+            result = subprocess.run(
+                [str(link), "version"], capture_output=True, text=True, check=True
+            )
         self.assertEqual(result.stdout.strip(), __version__)
 
     def test_entrypoint_uses_codex_plugin_data(self):

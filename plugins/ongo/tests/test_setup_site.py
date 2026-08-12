@@ -76,6 +76,7 @@ class SetupAndSiteTests(unittest.TestCase):
             {
                 "CLAUDE_PLUGIN_DATA": str(self.data),
                 "ONGO_KEN_DB": str(self.database),
+                "ONGO_LEGACY_STATE_PATH": str(self.root / "legacy-state.json"),
             },
             clear=False,
         )
@@ -120,6 +121,7 @@ class SetupAndSiteTests(unittest.TestCase):
             self.assertEqual(cli.setup_main(["--db", str(self.database)]), 0)
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["state"], str(self.data / "agent-state.json"))
+        self.assertEqual(payload["state_migration"]["status"], "none")
 
     def test_doctor_reports_compatible_database_and_required_kinds(self):
         source = str(self.data / "bin" / "ken")

@@ -7,6 +7,7 @@ experiments, message identity, and safety.
 ## Contents
 
 - [Create the loop](#create-the-loop)
+- [Upgrade a legacy loop](#upgrade-a-legacy-loop)
 - [Reconcile and renew](#reconcile-and-renew)
 - [Change cadence safely](#change-cadence-safely)
 - [Delegate research](#delegate-research)
@@ -34,6 +35,33 @@ Do not leave a null scheduler ID after reporting startup success.
 Claude Code durable cron jobs expire after seven days. Every tick therefore
 checks whether `scheduler.created` is older than three days and renews before
 expiry.
+
+## Upgrade a legacy loop
+
+Ongo setup migrates a 0.5.x `/tmp/ongo_state.json` only when the new data-dir
+state does not exist. It preserves the cursor, channel, cadence, current and
+previous cron IDs, writes the nested state atomically, and replaces the legacy
+path with a tombstone. Never initialize a second state or ordinary startup cron
+after `state_migration.status` reports `migrated`.
+
+When `scheduler.needs_prompt_upgrade` is true, replace the legacy cron using the
+same create-before-delete safety boundary:
+
+1. Capture both legacy `scheduler.id` and `scheduler.previous_id`.
+2. CronCreate one replacement whose prompt names the new absolute `STATE_PATH`.
+   Preserve fast mode; otherwise use `scheduler.normal_cron` when present or
+   derive the cadence from `normal_interval_minutes`.
+3. Atomically record the replacement ID and creation time, clear
+   `needs_prompt_upgrade`, and set `speaker_user_id` to the authenticated Slack
+   user ID.
+4. CronDelete both captured legacy IDs when present and distinct. Clear
+   `previous_id` only after the deletions succeed.
+5. List jobs and delete any remaining prompt beginning exactly
+   `Run one ongo research agent tick.`, regardless of which state path it names.
+
+The tombstone prevents the legacy prompt from operating on stale state during
+the bounded replacement window. Do not delete the old job before its
+replacement exists.
 
 ## Reconcile and renew
 
@@ -104,6 +132,7 @@ On an explicit shutdown message:
 1. Post the Ongo-prefixed shutdown notice.
 2. Read the current and previous scheduler IDs from durable state.
 3. CronDelete both when present.
-4. List scheduled jobs and delete any orphan whose prompt identifies itself as
-   one Ongo research tick for the same state path.
+4. List scheduled jobs and delete any orphan whose prompt begins
+   `Run one ongo research agent tick.`, including legacy jobs that name
+   `/tmp/ongo_state.json` instead of the current state path.
 5. Verify no matching job remains. Keep state and Ken data intact.

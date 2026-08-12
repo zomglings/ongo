@@ -36,6 +36,15 @@ task. The ChatGPT desktop app must remain running for local scheduled work, and
 the scheduled environment needs network access, clacks credentials, and write
 access to the Ongo data directory.
 
+### Upgrading an active Claude loop
+
+The first `ongo setup` after upgrading from 0.5.x migrates
+`/tmp/ongo_state.json` into the plugin data directory without resetting the
+Slack cursor. It tombstones the old path, then the Claude adapter replaces the
+legacy cron with a new-state prompt using create-before-delete and sweeps any
+older Ongo tick jobs. Do not manually start a second loop while that one-time
+migration is being reconciled.
+
 ## Usage
 
 ```

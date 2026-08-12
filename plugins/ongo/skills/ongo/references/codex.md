@@ -82,10 +82,12 @@ directory.
 
 If a controlling Codex skill requires a Slack identity prefix, store it in
 `speaker_prefix`, prepend it to every Ongo message, and pass it explicitly to
-`ongo slack poll --speaker-prefix`. This prevents Codex from reprocessing its
-own messages without baking a user-specific identity into Ongo. For example,
-the Rex skill requires the exact prefix `` `[rex]` `` followed by one space;
-configure that literal wire text, including the backticks.
+`ongo slack poll --speaker-prefix`. Always pass the authenticated Slack user as
+`--speaker-user-id` as well; prefix text alone is forgeable. This prevents
+Codex from reprocessing its own messages without allowing another channel user
+to self-censor a request. For example, the Rex skill requires the exact prefix
+`` `[rex]` `` followed by one space; configure that literal wire text,
+including the backticks.
 
 ## Shut down
 

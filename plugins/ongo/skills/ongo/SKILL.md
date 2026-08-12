@@ -59,6 +59,7 @@ Run setup and verify every reported check:
 SETUP=$("$ONGO" setup)
 KEN=$(printf '%s' "$SETUP" | jq -r '.ken')
 STATE_PATH=$(printf '%s' "$SETUP" | jq -r '.state')
+STATE_MIGRATION=$(printf '%s' "$SETUP" | jq -r '.state_migration.status')
 ```
 
 For a Slack loop, run `"$ONGO" doctor --json`. For one-shot experiment,
@@ -79,7 +80,11 @@ otherwise store an empty string. The Ongo marker always follows it, for example
 space. Preserve Markdown or other formatting in the prefix exactly as it appears
 on Slack; a visually similar plain-text prefix is not equivalent.
 
-Initialize the durable JSON state at `STATE_PATH`:
+If `STATE_MIGRATION` is `migrated`, read the Claude adapter's legacy-upgrade
+section before creating or changing any scheduler. If `STATE_PATH` already
+exists, validate and resume it; never overwrite an existing cursor or scheduler
+ID during startup. Refresh `speaker_user_id` from the authenticated `USER_ID`.
+Only when no state exists, initialize the durable JSON state at `STATE_PATH`:
 
 ```json
 {
@@ -91,6 +96,7 @@ Initialize the durable JSON state at `STATE_PATH`:
   "idle": false,
   "ken": "<absolute Ken path>",
   "speaker_prefix": "",
+  "speaker_user_id": "<authenticated Slack user ID>",
   "scheduler": {
     "host": "<claude|codex>",
     "id": null,
@@ -115,8 +121,10 @@ Treat these steps as the shared correctness contract for every scheduler:
    re-run startup or report the incomplete setup.
 2. Apply the host adapter's stale-scheduler reconciliation or update rules.
 3. Poll Slack with `"$ONGO" slack poll "$CHANNEL" "$LAST_USER_TS"`. When
-   `speaker_prefix` is non-empty, append
-   `--speaker-prefix "$SPEAKER_PREFIX"`.
+   `speaker_prefix` is non-empty, append `--speaker-prefix "$SPEAKER_PREFIX"`.
+   Always append `--speaker-user-id "$SPEAKER_USER_ID"`; the poller uses
+   Slack's authenticated sender metadata so another user cannot forge an Ongo
+   marker and get silently skipped.
 4. Check `status` before interpreting the message count.
    - `error`: post an Ongo-prefixed failure notice, leave `last_user_ts`
      unchanged, skip expansion and cadence counters, apply rate-limit backoff,

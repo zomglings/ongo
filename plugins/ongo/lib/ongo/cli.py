@@ -25,6 +25,7 @@ from .ken import (
     default_data_dir,
     install_ken,
 )
+from .state import migrate_legacy_agent_state
 
 
 HELP = """usage: ongo <command> [options]
@@ -225,13 +226,16 @@ def setup_main(argv):
     client = KenClient(binary=binary, db=args.db)
     client.initialize()
     client.ensure_kinds()
+    state = agent_state_path()
+    state_migration = migrate_legacy_agent_state(state)
     emit_json(
         {
             "ok": True,
             "ken": binary,
             "db": client.db,
             "cryptography": cryptography,
-            "state": str(agent_state_path()),
+            "state": str(state),
+            "state_migration": state_migration,
             "version": __version__,
         }
     )

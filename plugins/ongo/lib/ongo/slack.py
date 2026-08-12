@@ -2,7 +2,8 @@
 """`ongo slack poll` — gap-free Slack poll for the Ongo tick loop.
 
 Usage:
-    ongo slack poll <CHANNEL> <LAST_USER_TS> [--speaker-prefix <PREFIX>]
+    ongo slack poll <CHANNEL> <LAST_USER_TS>
+        [--speaker-prefix <PREFIX>] [--speaker-user-id <USER_ID>]
 
 Prints JSON. On success:
     {"status":"ok","total_seen":N,"user_count":N,
@@ -50,6 +51,8 @@ import subprocess
 import sys
 import time
 from decimal import Decimal, InvalidOperation
+
+from .errors import OngoArgumentParser
 
 LIM = "200"
 # Each individual page gets four attempts (initial + three retries).
@@ -107,7 +110,7 @@ def _read_page(channel, last_user_ts, cursor):
     return messages, next_cursor, error
 
 
-def poll(channel, last_user_ts, speaker_prefix=""):
+def poll(channel, last_user_ts, speaker_prefix="", speaker_user_id=""):
     messages = []
     cursor = None
     seen_cursors = set()
@@ -140,17 +143,30 @@ def poll(channel, last_user_ts, speaker_prefix=""):
     def is_bot(m):
         # Accept both the loop's [ongo] prefix and the subagent's
         # [ongo, <id>] / [ongo:<id>] prefix; the italics-wrapped _[ongo…
-        # variants are also bot-spoken. A host-required speaker prefix is
-        # removed first when explicitly configured. Anything else is a user
-        # message.
+        # variants are also bot-spoken. Text is forgeable, so a configured
+        # speaker identity is trusted only when Slack also attributes the
+        # message to that authenticated user (or supplies bot/app metadata).
         t = m.get("text", "").lstrip()
-        if speaker_prefix and t.startswith(speaker_prefix):
+        if speaker_prefix:
+            if not t.startswith(speaker_prefix):
+                return False
             t = t[len(speaker_prefix) :].lstrip()
-        return t.startswith((
+        marker = t.startswith((
             "[ongo]", "_[ongo]",
             "[ongo,", "_[ongo,",
             "[ongo:", "_[ongo:",
         ))
+        if not marker:
+            return False
+        if speaker_user_id:
+            trusted_sender = str(m.get("user") or "") == speaker_user_id
+            trusted_sender = trusted_sender or bool(
+                m.get("bot_id")
+                or m.get("app_id")
+                or m.get("subtype") == "bot_message"
+            )
+            return trusted_sender
+        return not speaker_prefix
 
     by_timestamp = {
         str(message["ts"]): message for message in messages if message.get("ts")
@@ -189,24 +205,24 @@ def poll(channel, last_user_ts, speaker_prefix=""):
 
 
 def main(argv=None):
-    args = list(sys.argv[1:] if argv is None else argv)
-    if args in (["-h"], ["--help"]):
-        print(
-            "usage: ongo slack poll <CHANNEL> <LAST_USER_TS> "
-            "[--speaker-prefix <PREFIX>]"
+    parser = OngoArgumentParser(prog="ongo slack poll")
+    parser.add_argument("channel")
+    parser.add_argument("last_user_ts")
+    parser.add_argument("--speaker-prefix", default="")
+    parser.add_argument("--speaker-user-id", default="")
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    if args.speaker_prefix and not args.speaker_user_id:
+        parser.error("--speaker-user-id is required with --speaker-prefix")
+    print(
+        json.dumps(
+            poll(
+                args.channel,
+                args.last_user_ts,
+                speaker_prefix=args.speaker_prefix,
+                speaker_user_id=args.speaker_user_id,
+            )
         )
-        return 0
-    speaker_prefix = ""
-    if len(args) == 4 and args[2] == "--speaker-prefix":
-        speaker_prefix = args[3]
-        args = args[:2]
-    if len(args) != 2:
-        sys.stderr.write(
-            "usage: ongo slack poll <CHANNEL> <LAST_USER_TS> "
-            "[--speaker-prefix <PREFIX>]\n"
-        )
-        return 2
-    print(json.dumps(poll(args[0], args[1], speaker_prefix=speaker_prefix)))
+    )
     return 0
 
 
