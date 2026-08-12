@@ -25,12 +25,14 @@ class CliTests(unittest.TestCase):
         result = self.run_cli("--help")
         self.assertEqual(result.returncode, 0)
         self.assertIn("experiment", result.stdout)
+        self.assertIn("skill --harness", result.stdout)
         self.assertIn("site build", result.stdout)
 
     def test_every_public_subcommand_has_help(self):
         commands = (
             ("setup",),
             ("doctor",),
+            ("skill",),
             ("slack", "poll"),
             ("arxiv", "sweep"),
             ("site", "build"),
@@ -64,6 +66,35 @@ class CliTests(unittest.TestCase):
                 result = self.run_cli(*command, "--help")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("usage:", result.stdout.lower())
+
+    def test_skill_renders_only_the_selected_harness(self):
+        cases = {
+            "claude": {
+                "included": ("targets the **Claude Code** harness", "CronCreate"),
+                "excluded": ("references/codex.md", "heartbeat automation"),
+            },
+            "codex": {
+                "included": ("targets the **Codex** harness", "heartbeat automation"),
+                "excluded": ("references/claude-code.md", "CronCreate"),
+            },
+        }
+        for harness, expected in cases.items():
+            with self.subTest(harness=harness):
+                result = self.run_cli("skill", "--harness", harness)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.startswith("---\nname: ongo\n"))
+                self.assertIn(f'"host": "{harness}"', result.stdout)
+                for text in expected["included"]:
+                    self.assertIn(text, result.stdout)
+                for text in expected["excluded"]:
+                    self.assertNotIn(text, result.stdout)
+
+    def test_skill_rejects_unknown_harness(self):
+        result = self.run_cli("skill", "--harness", "other")
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stderr)
+        self.assertEqual(payload["error"]["code"], "invalid-input")
+        self.assertIn("invalid choice", payload["error"]["message"])
 
     def test_unknown_command_is_structured(self):
         result = self.run_cli("does-not-exist")

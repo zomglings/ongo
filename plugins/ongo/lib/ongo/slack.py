@@ -2,7 +2,7 @@
 """`ongo slack poll` — gap-free Slack poll for the Ongo tick loop.
 
 Usage:
-    ongo slack poll <CHANNEL> <LAST_USER_TS>
+    ongo slack poll <CHANNEL> <LAST_USER_TS> [--speaker-prefix <PREFIX>]
 
 Prints JSON. On success:
     {"status":"ok","total_seen":N,"user_count":N,
@@ -107,7 +107,7 @@ def _read_page(channel, last_user_ts, cursor):
     return messages, next_cursor, error
 
 
-def poll(channel, last_user_ts):
+def poll(channel, last_user_ts, speaker_prefix=""):
     messages = []
     cursor = None
     seen_cursors = set()
@@ -140,8 +140,12 @@ def poll(channel, last_user_ts):
     def is_bot(m):
         # Accept both the loop's [ongo] prefix and the subagent's
         # [ongo, <id>] / [ongo:<id>] prefix; the italics-wrapped _[ongo…
-        # variants are also bot-spoken. Anything else is a user message.
+        # variants are also bot-spoken. A host-required speaker prefix is
+        # removed first when explicitly configured. Anything else is a user
+        # message.
         t = m.get("text", "").lstrip()
+        if speaker_prefix and t.startswith(speaker_prefix):
+            t = t[len(speaker_prefix) :].lstrip()
         return t.startswith((
             "[ongo]", "_[ongo]",
             "[ongo,", "_[ongo,",
@@ -187,12 +191,22 @@ def poll(channel, last_user_ts):
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     if args in (["-h"], ["--help"]):
-        print("usage: ongo slack poll <CHANNEL> <LAST_USER_TS>")
+        print(
+            "usage: ongo slack poll <CHANNEL> <LAST_USER_TS> "
+            "[--speaker-prefix <PREFIX>]"
+        )
         return 0
+    speaker_prefix = ""
+    if len(args) == 4 and args[2] == "--speaker-prefix":
+        speaker_prefix = args[3]
+        args = args[:2]
     if len(args) != 2:
-        sys.stderr.write("usage: ongo slack poll <CHANNEL> <LAST_USER_TS>\n")
+        sys.stderr.write(
+            "usage: ongo slack poll <CHANNEL> <LAST_USER_TS> "
+            "[--speaker-prefix <PREFIX>]\n"
+        )
         return 2
-    print(json.dumps(poll(args[0], args[1])))
+    print(json.dumps(poll(args[0], args[1], speaker_prefix=speaker_prefix)))
     return 0
 
 

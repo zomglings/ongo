@@ -27,8 +27,38 @@ from ongo.ken import (
     PUBLICATION_KINDS,
     RELATIONSHIP_KINDS,
     KenClient,
+    agent_state_path,
+    default_data_dir,
     verify_checksum,
 )
+
+
+class RuntimePathTests(unittest.TestCase):
+    def test_codex_plugin_data_precedes_claude_compatibility_data(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PLUGIN_DATA": "/tmp/codex-ongo-data",
+                "CLAUDE_PLUGIN_DATA": "/tmp/claude-ongo-data",
+            },
+            clear=True,
+        ):
+            self.assertEqual(default_data_dir(), Path("/tmp/codex-ongo-data"))
+            self.assertEqual(
+                agent_state_path(), Path("/tmp/codex-ongo-data/agent-state.json")
+            )
+
+    def test_explicit_ongo_data_precedes_host_data(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ONGO_DATA_DIR": "/tmp/explicit-ongo-data",
+                "PLUGIN_DATA": "/tmp/codex-ongo-data",
+                "CLAUDE_PLUGIN_DATA": "/tmp/claude-ongo-data",
+            },
+            clear=True,
+        ):
+            self.assertEqual(default_data_dir(), Path("/tmp/explicit-ongo-data"))
 
 
 @unittest.skipUnless(shutil.which("ken"), "Ken v3 is required")
@@ -78,6 +108,18 @@ class SetupAndSiteTests(unittest.TestCase):
             self.assertEqual(after.command("pubkind", "show", kind).returncode, 0)
         for kind in RELATIONSHIP_KINDS:
             self.assertEqual(after.command("relkind", "show", kind).returncode, 0)
+
+    def test_setup_reports_durable_agent_state_path(self):
+        source = str(self.data / "bin" / "ken")
+        output = io.StringIO()
+        with mock.patch.object(cli, "install_ken", return_value=source), mock.patch.object(
+            cli,
+            "install_cryptography",
+            return_value={"path": str(self.data / "python"), "version": "49.0.0"},
+        ), contextlib.redirect_stdout(output):
+            self.assertEqual(cli.setup_main(["--db", str(self.database)]), 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["state"], str(self.data / "agent-state.json"))
 
     def test_doctor_reports_compatible_database_and_required_kinds(self):
         source = str(self.data / "bin" / "ken")
@@ -166,6 +208,35 @@ class SetupAndSiteTests(unittest.TestCase):
                 report = cli.clacks_version()
             self.assertEqual(report["ok"], expected)
             self.assertEqual(report["minimum"], "0.14.1")
+
+    def test_doctor_can_validate_one_shot_runtime_without_clacks(self):
+        source = str(self.data / "bin" / "ken")
+        with mock.patch.object(cli, "install_ken", return_value=source), mock.patch.object(
+            cli,
+            "install_cryptography",
+            return_value={"path": str(self.data / "python"), "version": "49.0.0"},
+        ), contextlib.redirect_stdout(io.StringIO()):
+            cli.setup_main(["--db", str(self.database)])
+        output = io.StringIO()
+        with mock.patch.object(
+            cli, "clacks_version", side_effect=AssertionError("must not probe clacks")
+        ), contextlib.redirect_stdout(output):
+            self.assertEqual(
+                cli.doctor_main(
+                    [
+                        "--json",
+                        "--no-slack",
+                        "--ken",
+                        source,
+                        "--db",
+                        str(self.database),
+                    ]
+                ),
+                0,
+            )
+        report = json.loads(output.getvalue())
+        self.assertTrue(report["ok"])
+        self.assertNotIn("clacks", report["checks"])
 
     def test_site_is_private_by_default_and_uses_explicit_markers(self):
         client = KenClient(binary=str(self.data / "bin" / "ken"), db=str(self.database))

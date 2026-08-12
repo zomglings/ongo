@@ -7,8 +7,8 @@
     {
       "name": "ongo",
       "source": "./plugins/ongo",
-      "version": "0.5.1",
-      "description": "Claude Code research agent, deterministic experiment manager, and encrypted static publisher backed by Ken"
+      "version": "0.6.0",
+      "description": "Research agent, deterministic experiment manager, and encrypted static publisher for Claude Code and Codex"
     }
   ]
 }

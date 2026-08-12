@@ -1,0 +1,21 @@
+{
+  "name": "ongo",
+  "version": "0.6.0",
+  "description": "Research agent, deterministic experiment manager, and encrypted static publisher for Claude Code and Codex",
+  "author": {
+    "name": "zomglings"
+  },
+  "repository": "https://github.com/zomglings/ongo",
+  "license": "MIT",
+  "keywords": ["research", "experiments", "slack", "ken", "autonomous"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Ongo",
+    "shortDescription": "Run auditable research and experiments.",
+    "longDescription": "Manage research, deterministic experiments, Slack polling, Ken records, and protected static publishing.",
+    "developerName": "zomglings",
+    "category": "Productivity",
+    "capabilities": ["Research", "Write", "Scheduled"],
+    "defaultPrompt": "Start Ongo in this project."
+  }
+}

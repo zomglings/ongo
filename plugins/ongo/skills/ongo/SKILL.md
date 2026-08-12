@@ -1,686 +1,203 @@
 ---
 name: ongo
-description: >-
-  Research agent, deterministic experiment-management toolkit, and encrypted
-  static publisher. Use for planning, approving, executing, or verifying
-  experiments; managing public or symmetric-key-protected Ongo content; polling
-  Slack; tracking findings in Ken; autonomous expansion; and self-improvement.
-args: "[--channel <channel_id>] [--interval <minutes>] [--idle]"
+description: Research agent, deterministic experiment manager, and encrypted static publisher. Use for starting or operating the Ongo Slack research loop; planning, approving, executing, or verifying experiments; managing Ken research records; running arXiv expansion; or publishing public and protected Ongo content.
 ---
 
-# Ongo — Autonomous Research Agent
+# Ongo
 
-## Parameters
+Use the bundled CLI for deterministic state changes and the active host's agent
+tools for reasoning, delegation, and scheduling.
 
-- `--channel <id>` — Slack channel (default: auto-discover self-DM)
-- `--interval <minutes>` — tick interval in minutes (default: 30)
-- `--idle` — only respond to messages; disable auto-expansion
+Recognize these invocation parameters:
 
-## Startup
+- `--channel <id>`: use an explicit Slack channel instead of a self-DM.
+- `--interval <minutes>`: set the normal cadence; default to 30.
+- `--idle`: respond to Slack messages without passive expansion.
 
-### 1. Initialize the plugin runtime
+## Choose the host adapter
 
-**jq**: `command -v jq` — if missing, tell the user to install it and halt.
+Before creating, updating, or deleting a scheduled loop, read exactly one host
+adapter completely:
 
-**clacks**: `command -v clacks` — if missing, run
-`uv tool install 'slack-clacks>=0.14.1' || pip install 'slack-clacks>=0.14.1'`.
-The version floor is load-bearing because `ongo slack poll` requires explicit
-Slack cursor pagination and ascending timestamp order.
+- Claude Code: [references/claude-code.md](references/claude-code.md)
+- Codex: [references/codex.md](references/codex.md)
 
-The plugin-root `bin/` directory is on Claude Code's Bash `PATH`. Use the
-plugin-shipped `ongo` command; never reconstruct a plugin-cache path. After jq
-and clacks are available, initialize and check the runtime:
+For one-shot CLI, experiment, or publishing work, no scheduler adapter is
+required. If neither host exposes a supported scheduler, complete the one-shot
+work and explain that recurring operation is unavailable in that surface.
+
+## Resolve the runtime
+
+Resolve this skill's absolute directory from the skill metadata supplied by the
+host. Claude Code may expose it as `CLAUDE_SKILL_DIR`; Codex includes the skill
+path in its available-skills metadata. Never reconstruct a cache path.
+
+Use the wrapper beside this file for every Ongo command:
 
 ```bash
-SETUP=$(ongo setup)
-ongo doctor --json
-KEN=$(printf '%s' "$SETUP" | jq -r '.ken')
+ONGO="<absolute-skill-directory>/scripts/ongo"
+"$ONGO" version
 ```
 
-`ongo setup` installs the checksum-pinned Ken v3 platform binary and pinned
-`cryptography` build dependency under
-`${CLAUDE_PLUGIN_DATA}`, initializes the selected database, and idempotently
-registers every publication and relationship kind Ongo requires. If either
-command fails, show its structured error and halt.
+The wrapper locates the plugin root without relying on host PATH injection.
 
-Verify clacks authentication and capture `USER_ID`:
+Require `jq`. Require `clacks >= 0.14.1` only for Slack-loop or arXiv-digest
+work. If clacks is missing, install `slack-clacks>=0.14.1` only with the user's
+authorization. If Slack is required and `clacks auth status` has no `user_id`,
+ask the user to run `clacks auth login` and stop setup.
 
 ```bash
 AUTH_INFO=$(clacks auth status)
+USER_ID=$(printf '%s' "$AUTH_INFO" | jq -r '.user_id // empty')
 ```
 
-If `echo "$AUTH_INFO" | jq -r '.user_id'` is empty, tell the user to run
-`clacks auth login` and halt.
+## Initialize Ongo
 
-### 2. Connect to Slack
+Run setup and verify every reported check:
 
-If no `--channel`, discover self-DM:
 ```bash
-STARTUP_INFO=$(clacks send -u "$USER_ID" -m "_[ongo] Research agent active in $(pwd)_")
+SETUP=$("$ONGO" setup)
+KEN=$(printf '%s' "$SETUP" | jq -r '.ken')
+STATE_PATH=$(printf '%s' "$SETUP" | jq -r '.state')
 ```
-If `--channel` provided:
-`STARTUP_INFO=$(clacks send -c "$CHANNEL" -m "_[ongo] Research agent active in $(pwd)_")`
 
-Then capture `CHANNEL=$(printf '%s' "$STARTUP_INFO" | jq -r '.channel')` and
-`STARTUP_TS=$(printf '%s' "$STARTUP_INFO" | jq -r '.ts')`. For an explicitly
-provided channel, retain that channel if the response omits `.channel`.
+For a Slack loop, run `"$ONGO" doctor --json`. For one-shot experiment,
+publishing, or Ken work that does not use Slack, run
+`"$ONGO" doctor --json --no-slack`. Verify every reported check.
 
-If CHANNEL or STARTUP_TS is empty, halt.
+`ongo setup` installs checksum-pinned Ken v3 and the pinned `cryptography`
+dependency in Ongo's writable data directory. Data-directory precedence is
+`ONGO_DATA_DIR`, `PLUGIN_DATA`, `CLAUDE_PLUGIN_DATA`, `XDG_DATA_HOME/ongo`, then
+`~/.local/share/ongo`.
 
-### 3. Initialize state and start cron loop
+For a Slack loop, send the startup message to the requested channel or discover
+the self-DM with `clacks send -u "$USER_ID"`. Capture both the returned channel
+and timestamp. A host or controlling skill may require a leading identity
+prefix for every Slack message. Store that exact prefix in `speaker_prefix`;
+otherwise store an empty string. The Ongo marker always follows it, for example
+`` `[rex]` [ongo] ...`` when `speaker_prefix` is `` `[rex]` `` followed by one
+space. Preserve Markdown or other formatting in the prefix exactly as it appears
+on Slack; a visually similar plain-text prefix is not equivalent.
 
-Write initial state to `/tmp/ongo_state.json`:
+Initialize the durable JSON state at `STATE_PATH`:
+
 ```json
 {
-  "channel": "<CHANNEL>",
-  "last_user_ts": "<STARTUP_TS bootstrap cursor>",
-  "last_self_improve": <current unix epoch>,
+  "channel": "<channel>",
+  "last_user_ts": "<startup timestamp>",
+  "last_self_improve": 0,
   "last_arxiv_daily": 0,
   "rotation": "reference",
   "idle": false,
-  "ken": "<KEN from ongo setup>",
-  "cron_id": null,
-  "prev_cron_id": "",
-  "cron_created": <current unix epoch>,
-  "normal_cron": "<computed cron expression from --interval>",
-  "mode": "normal",
-  "fast_idle_polls": 0
+  "ken": "<absolute Ken path>",
+  "speaker_prefix": "",
+  "scheduler": {
+    "host": "<claude|codex>",
+    "id": null,
+    "previous_id": null,
+    "created": 0,
+    "normal_interval_minutes": 30,
+    "mode": "normal",
+    "fast_idle_polls": 0
+  }
 }
 ```
 
-Set `idle` to `true` if `--idle` was passed.
-
-Compute the cron expression from `--interval` (default 30 minutes):
-- For intervals that evenly divide 60 (e.g. 5, 10, 15, 30): use `*/N` with a small offset to avoid :00/:30 marks. Example: 30 min → `"7,37 * * * *"`, 15 min → `"7,22,37,52 * * * *"`.
-- For other intervals: pick explicit minutes that approximate the interval. Example: 20 min → `"7,27,47 * * * *"`.
-
-Create the cron job using **CronCreate**:
-```
-cron: "<computed expression>"
-recurring: true
-durable: true
-prompt: <THE TICK PROMPT — see below>
-```
-
-The tick prompt must be **self-contained** since each cron fire is a fresh context. It should contain:
-
-> Run one ongo research agent tick.
->
-> 1. Read state: `cat /tmp/ongo_state.json`
-> 2. Poll Slack with the robust poller: `ongo slack poll "$CHANNEL" "$LAST_USER_TS"` — returns JSON `{status, total_seen, user_count, newest_user_ts, user_messages[]}`. Do **not** call `clacks read --after` directly (see "Polling correctly" below). **Check `status` first** (load-bearing — see "Polling correctly"):
->    - `status == "error"`: the read **failed** (rate limit / API error). This is **not** an idle tick. Send `_[ongo] Poll failed (<error>) — backing off, will retry next tick._`, **leave `last_user_ts` unchanged**, do **not** run auto-expansion, do **not** increment `fast_idle_polls`, and if `error == "ratelimited"` and `mode == "fast"` revert to `normal_cron` (see "Slack API rate-limit budget"), then end the tick.
->    - `status == "ok"`: every Slack cursor page in the window was read; proceed normally.
-> 3. The poller filters out `[ongo]`/`_[ongo]` bot messages and returns only user messages with `ts > LAST_USER_TS`, ascending by `ts`.
-> 4. **If `status == "ok"` and `user_count > 0`**: send `_[ongo] Processing..._`, process **every** returned user message in ascending order (do not skip any, even if you also spawn a background agent for one).
-> 5. **If `status == "ok"` AND no user messages AND not idle**: run auto-expansion — pick a topic from kendb weighted by exploration directives, launch a background research subagent (rotate: reference/Sonnet → deep notes/Opus → survey/Opus). There are **no per-topic refresh fields**; a frequently-prioritized topic stays fresh purely via its directive weight. (A `status == "error"` poll is never an idle tick — do not expand on it.)
-> 6. **If 24h since last_self_improve**: run self-improvement cycle (layers A–E per SKILL.md).
-> 7. **On `/quit`, `/stop`, `/exit`**: send `_[ongo] Shutting down._`, then CronDelete `cron_id` **and** sweep for orphan crons (any cron whose prompt begins `Run one ongo research agent tick.` — fast-mode/renewal swaps may have left a stale one), and stop. See "Shutdown".
-> 8. **Fast-mode transition** (see "Fast mode"), only when `status != "error"`: if `user_count > 0`, reset `fast_idle_polls=0` and enter fast mode (1-min cron) if currently normal via the **safe cron-swap procedure**; if `user_count == 0` and `status == "ok"` and in fast mode, increment `fast_idle_polls` and exit to `normal_cron` after it reaches 5.
-> 9. **Only after every returned user message has been handled/dispatched**, advance `last_user_ts` to the **longest fully-handled ascending prefix** of `user_messages` (the last message such that it and every earlier message was handled/dispatched-OK) and write state back — this equals `newest_user_ts` only if the whole batch succeeded; if a middle message failed, stop at the last good one *before the hole*. If `status == "error"` or `user_count == 0`, leave `last_user_ts` unchanged. **Never** advance past an unprocessed/failed user message, and **never** advance because the bot sent a message. A re-surfaced already-answered message is the accepted cost of never losing one. Load-bearing: see "Polling correctly".
->
-> Always prepend `[ongo]` to every Slack message. Ken binary at: $KEN. Truncate responses over 30000 chars.
-
-After creating the cron job, report:
-```
-_[ongo] Research agent active — durable cron loop every N min; auto-expires after 7 days unless renewed._
-```
-
-The initial state above writes `"cron_id": null` (the cron does not exist yet at state-init time) and `"prev_cron_id": ""` (no swap has happened yet). Immediately after **CronCreate** succeeds, overwrite `"cron_id"` with the returned job ID and refresh `"cron_created"` to the creation epoch, then write state back, so the job can be renewed and cancelled. A tick that reads state and finds `cron_id == null` means CronCreate never completed — re-run startup step 3 rather than attempting renewal/shutdown against a nonexistent job.
-
-## Main Loop
-
-The main loop is driven by **CronCreate** — each tick fires as an independent cron job when the REPL is idle. There is no `sleep` or blocking wait. This means:
-
-- **Context is freed between ticks** — the agent is not consuming resources while waiting.
-- **User can interact normally** between ticks — the REPL remains responsive.
-- **Ticks fire at consistent wall-clock times** regardless of how long the previous tick took.
-- **Durable across Claude restarts** — the cron job is persisted by Claude Code,
-  but still auto-expires after 7 days unless renewed.
-
-**CRITICAL — Cron renewal**: CronCreate jobs auto-expire after 7 days. To ensure ongo **never stops looping**, every tick must check `cron_created` in state. If 3 days (259200 seconds) have passed, renew the cron job. Before recording an `ongo-cron-reset` publication, run `ongo setup` so the selected database and custom kinds exist. **The loop must never be allowed to expire.**
-
-**Safe cron-swap procedure (the canonical primitive — used by renewal AND every fast-mode mode change):** the swap is **create-then-delete**, in this exact order:
-
-1. `CronCreate` the new job (same tick prompt; new expression).
-2. **Only after** the new `cron_id` is in hand, write state to `/tmp/ongo_state.json`: set `cron_id` to the new id, set `cron_created`, copy the *previous* `cron_id` into `prev_cron_id`, and update `mode`/`fast_idle_polls`/`normal_cron` as applicable.
-3. `CronDelete` the **old** id. On success, clear `prev_cron_id` (write state). On failure, leave `prev_cron_id` set so the next tick retries.
-4. Run `ongo setup`, then log the `ongo-cron-reset` kendb entry (old id → new id, reason).
-
-**Stale-cron reconciliation (tick step 2, runs every tick before the renewal check):** if `prev_cron_id` is non-empty and not equal to the current `cron_id`, attempt `CronDelete prev_cron_id`; on success clear it. This guarantees that a tick which died mid-swap (leaving a duplicate) is self-healed by the *next* fire of either surviving cron — the transient duplicate is bounded to one tick interval.
-
-Rationale: each tick is an independent, killable context. **Never `CronDelete` before the replacement exists.** Delete-then-create has a fatal window: if the tick dies (or `CronCreate` fails) after the delete, there is **zero** cron left and nothing can recreate it — the loop is permanently dead. Create-then-delete fails safe: a crash in the window leaves a transient *duplicate* cron (both fire; reconciliation above deletes the stale id on the next tick), which is recoverable. A brief duplicate is acceptable; a gap is not.
-
-**Durability is uniform**: every `CronCreate` ongo issues — startup, renewal, fast-mode enter, fast-mode exit — uses the **same** `recurring: true` **and `durable: true`** settings. `durable: true` writes the job to `.claude/scheduled_tasks.json` so it survives Claude restarts (a `/exit`, a `/model` swap that restarts the REPL, a crash, anything short of an OS reboot that also wipes the harness state dir). The 7-day API expiry still applies — durability is *across sessions*, not *across the 7-day ceiling* — so the renewal check at "Cron renewal" remains required. The previous policy of `durable: false` was a hole: a session restart that did **not** route through ongo's `/quit` handler (any normal `/exit`, `/clear`, model swap) silently killed the cron, the new session inherited no cron, and renewal could not fire because there was no tick context to fire it from. Do not request `durable` for some swaps and not others — mixed durability across the swap sites makes the cross-session guarantee non-uniform and unanalyzable.
-
-Do NOT preemptively shut down for context concerns — each tick is a fresh context. Only shut down on explicit user command (`/quit`, `/stop`, `/exit`).
-
-### Concurrency — parallelize independent work
-
-When a tick (or a user request) implies more than one **independent** unit of work — e.g. a user-facing deliverable plus loop/skill maintenance plus research expansion — launch a background subagent **per unit, in the same turn**, and continue immediately. Do **not** serialize independent tasks, and never let the loop's own bookkeeping (polling, state writes, repo/PR work, self-improvement layers) block or delay a user-facing deliverable.
-
-- The main loop is deliberately lean precisely so heavyweight work can be delegated and run concurrently. Underusing concurrency wastes that design and adds latency to things the user is waiting on.
-- Serialize for **two** reasons only: a genuine **data dependency** (B needs A's output) **or** a **write conflict** (A and B mutate the same artifact). Absent both, fan out.
-- All spawns remain subject to the memory-tier gate (see Auto-Expansion). Within the allowed tier, prefer launching the user deliverable first, then the maintenance work, both in the background.
-- A user deliverable must never wait on unrelated maintenance. If both are due in one tick, the deliverable subagent is launched first and does not block on the rest.
-
-**Same-artifact work is NOT independent — never fan it out.** Two agents writing the same file/note/document/kendb publication concurrently is a race: the later writer silently clobbers the earlier, or you get a half-merged artifact. A data dependency is not required for this to be unsafe — two blind writers need nothing from each other and still corrupt the result. "Independent" means *disjoint write targets*.
-
-**Operational test — apply before every fan-out.** For each pair of units about to be launched in the same turn, enumerate the concrete artifacts each will *write*: file paths it will edit, kendb publication IDs/keys it will `add`/relate/`ongo ken delete`, the SKILL.md self-modification file, the Slack channel state, `/tmp/ongo_state.json`. If the write-sets intersect (same path, same publication ID/key, same file), the units are **not** independent — collapse them into one agent. When in doubt, treat the artifact as shared and serialize; a missed parallelization costs latency, a missed conflict costs the artifact. Read-only overlap (both agents `ken list` the same kind) is fine; only overlapping **writes** force serialization.
-
-**Follow-ups to in-flight work.** If new instructions arrive for work an agent is already doing (e.g. the user adds a requirement to a document being revised, or a second message targets a note another tick's agent is writing), **send them to the existing agent via SendMessage — do not spawn a second agent on the same artifact.** If the agent has already finished, launch a *single* successor that reads the current on-disk/kendb state and edits forward; never launch two successors. One artifact ⇒ at most one writer in flight. Concurrency parallelizes across artifacts, never within one. This is the only safe way to honor "process every returned user message" (Tick step 6) when two messages in one batch touch the same artifact: they are processed in ascending order by the *same* writer, not by racing agents.
-
-### Tick (cron-fired)
-
-Each tick is self-contained. It reads state from `/tmp/ongo_state.json`, executes, and writes state back.
-
-1. Read `/tmp/ongo_state.json` to recover CHANNEL, LAST_USER_TS, rotation, idle, ken path, last_self_improve, cron_id, cron_created, prev_cron_id.
-2. **Stale-cron reconciliation**: if `prev_cron_id` is non-empty and ≠ `cron_id`, `CronDelete prev_cron_id`; on success clear `prev_cron_id` and write state. (Self-heals a duplicate left by a tick that died mid-swap; see "Cron renewal".)
-3. **Cron renewal check**: if current time minus `cron_created` > 259200 (3 days), renew the cron job via the **safe cron-swap procedure** (CronCreate new → write state → CronDelete old → log `ongo-cron-reset`; see "Cron renewal"). Never delete the old cron before the new one exists.
-4. Poll: `ongo slack poll "$CHANNEL" "$LAST_USER_TS"`. Parse its JSON and **branch on `status`** (this check is load-bearing — a missing-status check is exactly how the loop went silently deaf historically):
-   - `status == "error"`: read **failed** (rate limit / API error). Send `_[ongo] Poll failed (<error>) — backing off._`, leave `LAST_USER_TS` unchanged, **skip steps 6–9** (no expansion, no fast-mode counter change). If `error == "ratelimited"`, additionally follow the cadence back-off in "Slack API rate-limit budget" (revert fast mode if active). End tick.
-   - `status == "ok"`: every Slack cursor page in the window was read; proceed normally.
-5. `user_messages` (bot-filtered, `ts > LAST_USER_TS`, ascending) are the messages to handle.
-6. **`user_count > 0`**: send `_[ongo] Processing..._`, then for **every** message in ascending order: process it (or dispatch a background agent for it), respond via `clacks send -c "$CHANNEL" -m "[ongo] <response>"`. Do not skip any, even partially-handled ones. **A message is "handled" only once it has either been answered inline or successfully dispatched to a background agent that acknowledged start.** If processing or dispatch of message *i* fails (exception, agent failed to launch, dispatch errored), stop treating later messages as gating: record the *highest ts that was fully handled with no unhandled message before it* — this, not `newest_user_ts`, is what step 10 may advance to. A dispatched agent that later *fails mid-work* must post the failure to Slack so the user can re-ask.
-7. **`status == "ok"` AND no user messages AND not idle**: run auto-expansion (see Auto-Expansion section). (Never on `status == "error"`.)
-8. **24h since last_self_improve** (or user requested): run self-improvement, update last_self_improve.
-9. **Fast-mode transition** (see "Fast mode"), only when `status != "error"`: `user_count > 0` → `fast_idle_polls=0`, enter fast mode if normal (no swap if already fast); `user_count == 0` and `status == "ok"` and fast → `fast_idle_polls++`, exit to `normal_cron` at 5. Every mode change uses the **safe cron-swap procedure** (create-then-delete; see "Cron renewal").
-10. Advance the gate to the **longest fully-handled ascending prefix**, never blindly to `newest_user_ts`. Concretely: walk `user_messages` ascending; set `LAST_USER_TS` to the ts of the last message such that *it and every message before it* was handled (step 6 definition). If the whole batch succeeded this equals `newest_user_ts`. If a middle message failed, the gate stays at the last good message *before the hole* — the failed message and everything after it stay outstanding and are re-polled next tick. **Never advance past a hole**, even though that means already-answered later messages in the same batch will be re-surfaced and re-answered (accepted: see "Reprocessing"). If `status == "error"` or `user_count == 0`, leave `LAST_USER_TS` unchanged. Then write state back.
-
-### Polling correctly
-
-`clacks read -c $CHANNEL --after $ts` is **not** a safe primitive for the loop and must not be used directly. Four bugs were found and fixed in sequence (each fix exposed the next):
-
-- **Capped slice.** `clacks read --after` returns a bounded *oldest-first* slice (~15–20 msgs) anchored at `--after`, not a stream of everything since. Once the bot's own `[ongo]` messages exceed that slice it is pure bot chatter and real user messages further ahead are never returned — the filter then truthfully reports "0 user messages" of a window that structurally cannot contain them.
-- **Bot-contaminated cursor.** The first fix advanced the cursor to the newest message *including the bot's own sends*. A user message timestamped before one of the bot's sends but after the previous cursor was then excluded by the `> cursor` filter next poll — silently missed because the bot "spoke later." This actually happened (four user messages lost in one busy turn).
-- **Three reads / poll → masked rate limit.** A later design issued three reads per poll (`recent` + `--since` + `--after`); under 1-min fast-mode polling this tripped Slack HTTP-429 `ratelimited`, and because every read was `try/except -> []` a hard 429 was read as "0 messages, all clear" — deaf again.
-- **Single capped read silently truncates.** A single `clacks read --since LAST_USER_TS -l 200` returns only the newest page. The attempted timestamp rewind could only replay that same page, so older messages remained invisible. The poller now follows every opaque `response_metadata.next_cursor` from Clacks, merges and deduplicates the pages, sorts the complete window by exact Slack timestamp, and returns `ok` only after the cursor is exhausted.
-
-**The poller contract.** `ongo slack poll` takes `LAST_USER_TS`, issues `--since LAST_USER_TS` and follows every Slack cursor page (a Slack `ts` is a valid `--since` value; `--after` is unsafe per the bugs above), filters out `[ongo]`/`_[ongo]` bot messages, deduplicates and returns user messages with `ts > LAST_USER_TS` ascending, and returns `ok` only after the cursor is exhausted. Any page failure returns `error` with no partial messages and leaves the gate unchanged; each failed page gets exponential back-off 5/15/30s. **The caller MUST branch on `status`**: `error` is not idle and must not advance the gate or trigger expansion.
-
-**The invariant.** After the one-time `STARTUP_TS` bootstrap anchor, the gate is
-`LAST_USER_TS` = ts of the most recent USER message *actually processed*. It
-advances **only** when user messages are handled, **never** because the bot sent
-something, and **never** past an unprocessed user message. There is no separate
-bot-influenced cursor — bot/loop traffic is irrelevant to whether a user message
-is outstanding. Process the whole returned batch each tick in ascending order;
-only then advance `LAST_USER_TS` over the fully-handled prefix (Tick step 10).
-The delivery guarantee is **at-least-once, never-lost**: "every user message is
-eventually processed; after a mid-batch handling failure a newer suffix may be
-re-seen" — not "exactly once" and not "ride the head of the channel."
-At-least-once with bounded duplication is strictly safer than silent drops. Slack `ts` are
-canonical `<10-digit-seconds>.<6-digit-micros>` strings; in the current epoch
-era (2001–2286) integer width is fixed, so the poller's lexicographic `ts`
-comparison is equivalent to numeric ordering for all genuine message timestamps.
-
-**Reprocessing (accepted tradeoff).** Because the gate may only advance over a contiguous handled prefix and **never past an unprocessed (failed/held) message**, a later message in the same batch that *was* answered will be re-surfaced and re-answered on the next poll if an earlier message in that batch failed. This is not a bug — it is the chosen behavior, and it has been observed (a Markov-chain question got a second answer after an earlier message in its batch errored). Loss is unacceptable; a duplicate answer is merely noisy. Mitigations, in order: (a) make message handling **idempotent where cheap** — before answering, a handler may scan recent `[ongo]` sends for an answer it already posted to the same question and skip/acknowledge instead of recomputing; (b) keep batches small (fast mode shortens the poll window, shrinking batches and thus the reprocess blast radius); (c) when re-answering a known duplicate, prefix `_[ongo] (re-sending — earlier sibling in this batch failed)_` so the user understands the repeat. None of these may weaken the rule: **the gate still never advances past the failed message.**
-
-There are deliberately **no per-topic scheduling fields** in state (e.g. no `last_<topic>_refresh`). Keeping any one topic current is the job of the directive-weighted auto-expansion (Tick step 7), not bespoke per-topic timers — those don't generalize and put scheduling policy in state instead of in the loop.
-
-### Fast mode — responsive polling during active conversations
-
-The base cadence (`--interval`, default 30 min) is fine when idle but far too slow when the user is actively talking. **Fast mode** makes the loop poll every 1 minute while a conversation is live, then fall back automatically.
-
-State carries: `"mode"` (`"normal"` | `"fast"`, default `"normal"`), `"fast_idle_polls"` (int, default `0`), and `"normal_cron"` (the base cron expression computed at startup from `--interval`, stored so it can be restored).
-
-Cron expressions: normal = `normal_cron`; fast = `"* * * * *"` (every minute).
-
-Transition logic, evaluated every tick **after** polling and message handling, **before** the state write:
-
-- **`user_count > 0`** (the user said something): set `fast_idle_polls = 0`. If `mode == "normal"`, **enter fast mode**: perform the **safe cron-swap procedure** (see "Cron renewal") with the new expression `"* * * * *"` and the same tick prompt; also set `mode = "fast"` in the same state write. (`recurring: true`, `durable: true` — same as every other CronCreate.) If `mode == "fast"` already, do **not** swap — only the `fast_idle_polls = 0` reset applies (no cron churn for an ongoing back-and-forth).
-- **`user_count == 0` and `status == "ok"` and `mode == "fast"`**: increment `fast_idle_polls`. If `fast_idle_polls >= 5`, **exit fast mode**: perform the **safe cron-swap procedure** with the new expression `normal_cron`; in the same state write set `mode = "normal"` and `fast_idle_polls = 0`.
-- **`mode == "normal"` and `user_count == 0`**: nothing.
-- **`status == "error"`**: no fast-mode transition counter change; if `error == "ratelimited"` and `mode == "fast"`, revert to `normal_cron` per "Slack API rate-limit budget".
-
-Properties: entering fast mode is immediate on the first detected user message; a back-and-forth keeps resetting `fast_idle_polls` (no extra cron swap — only the normal→fast and fast→normal edges swap) so the loop stays at 1-min cadence for the whole exchange; after 5 consecutive 1-min polls (~5 min) with silence it reverts. The cron-renewal check still applies to whichever cron is active.
-
-**Swap churn is bounded.** At most one cron swap per fast/normal *edge*: a sustained conversation triggers exactly one normal→fast swap, and reversion triggers exactly one fast→normal swap. Even a pathological pattern (one user message every ~6 min forever) is bounded to one pair of swaps per ~5-min reversion cycle — not per message — because the `mode == "fast"` guard above suppresses redundant swaps. This is safe given the create-then-delete primitive.
-
-**Renewal interaction (load-bearing).** Every swap *is* a fresh `CronCreate`, so it resets the new cron's own 7-day expiry clock — and `cron_created` is updated to match. A long-lived flapping session therefore keeps resetting `cron_created`, so the explicit 3-day renewal check may *never* fire. That is acceptable **only because** each swap is itself a real fresh cron that restarts the 7-day clock — i.e. swaps double as renewals. This makes the safe-swap primitive's create-then-delete ordering not merely advisory but **required**: a swap that deletes the old cron and then fails to create the new one leaves zero cron *and* a `cron_created` that no longer reflects reality, with no surviving cron to ever run the renewal check — unrecoverable. Never weaken the swap ordering.
-
-### Slack API rate-limit budget
-
-Slack rate-limits **per method, per workspace**. The two methods ongo uses:
-
-- `clacks read` → `conversations.history` — **Tier 3, ~50 requests/minute**.
-- `clacks send` → `chat.postMessage` — roughly **1 message/second sustained** per channel.
-
-**Calls per tick** (count them — this is load-bearing):
-
-| Operation | `read` calls | `send` calls |
-|---|---|---|
-| `ongo slack poll` | 1 per cursor page (up to 4 attempts for a failing page) | 0 |
-| `_[ongo] Processing..._` | 0 | 1 (only if `user_count > 0`) |
-| Per user message reply | 0 | 1 × `user_count` |
-| Fast-mode / cron-reset status post | 0 | 0–1 |
-| Auto-expansion subagent report | 0 | 1 (idle ticks, async) |
-| Self-improvement reports (every 24h) | 0 | up to ~6 |
-
-A normal idle tick and a burst fitting one Slack page use **1 read**. A backlog spanning `P` pages uses `P` reads; a 3-message busy tick uses **1 read + 4 sends**.
-
-**The real incident**: an earlier design did 3 overlapping reads/poll and fast mode polled every 60s unconditionally; ad-hoc reads then pushed `conversations.history` into HTTP-429, which was mis-read as "0 messages, all clear." The poller now makes one read for an ordinary tick and adds reads only when Slack supplies an explicit continuation cursor; failed pages use bounded exponential back-off.
-
-**Safe ceiling**: ordinary sustained 1-min polling is `60 reads/hr`; cursor pages add requests only in proportion to a real backlog. Do not add speculative or ad-hoc `clacks read` calls outside `ongo slack poll`. If pagination reaches Slack's limit, the page returns `ratelimited`, the poller leaves the gate unchanged, and the cadence back-off below applies.
-
-**Rate-limit-aware back-off (cadence)**: if `ongo slack poll` returns `status == "error"` with `error == "ratelimited"` (the poller has already exhausted its internal ~50s back-off), the tick **must not** treat it as idle and **must not** keep hammering at the current cadence:
-
-1. Report `_[ongo] Slack rate-limited — backing off, will retry next tick._` (a single `send`; skip even this if the rate limit is on `chat.postMessage`).
-2. Leave `LAST_USER_TS` unchanged (unread window is unknown — see "Polling correctly").
-3. **If `mode == "fast"`**: immediately revert to `normal_cron` for this back-off via the **safe cron-swap procedure** (CronCreate `normal_cron` → write state with `mode = "normal"`, `fast_idle_polls = 0` → CronDelete old → log `ongo-cron-reset`). A 60s cadence is what produced the 429 in the first place; backing the cadence off to the normal interval is the correct response, and a genuine subsequent user message will re-enter fast mode normally.
-4. Do not advance any cron-renewal or self-improvement work this tick.
-
-This makes fast mode rate-limit-aware: it accelerates for live conversations but yields the moment Slack signals overload, instead of compounding the problem.
-
-### Shutdown
-
-On `/quit`, `/stop`, or `/exit` in a user message:
-1. Send `_[ongo] Shutting down._`
-2. Read `cron_id` from `/tmp/ongo_state.json`.
-3. Cancel the cron job via **CronDelete** with that ID.
-4. **Defensively sweep for orphans.** `cron_id` is rewritten on every fast-mode swap and every 3-day renewal (create-then-delete). If a previous swap was interrupted between the create and the `prev_cron_id` cleanup, a stale ongo cron can still be live with an ID no longer in `cron_id` (check `prev_cron_id` too). List all cron jobs and CronDelete any whose prompt is the ongo tick prompt (it begins with `Run one ongo research agent tick.`), not only the one recorded in state. Shutting down while leaving an orphan cron alive means the loop never actually stops.
-5. Stop processing.
-
-## Processing Messages
-
-Interpret as natural language. The user might ask to:
-- **Research** — web search, add to kendb, summarize. Log ken errors to Slack and continue.
-- **Manage kendb** — `ken list`, report results
-- **Update exploration strategy** — add/update `ongo-exploration` entries
-- **Trigger self-improvement** — run any single layer (A–E) or all
-- **Anything else** — use judgment
-
-Prefer delegating heavyweight research requests to subagents using the most capable available model (opus at time of writing — check for newer models during self-improvement) with the self-contextualization pattern below. Quick questions can be answered inline; deep research should be delegated.
-
-!`d="${CLAUDE_SKILL_DIR:-$(([ -d "$HOME/.claude/skills/ongo" ] && echo "$HOME/.claude/skills/ongo") || (ls -d "$HOME"/.claude/plugins/cache/ongo/ongo/*/skills/ongo 2>/dev/null | sort -V | tail -1))}"; "$d/scripts/print-style.sh" section`
-
-## Deterministic Experiments
-
-The `ongo experiment` CLI is the sole authority for Ongo experiment state.
-Neither the driving agent nor a worker may use direct `ken add`, `ken load`,
-SQLite, or `ongo ken delete` commands for experiment publication kinds.
-
-### Plan and review
-
-1. Turn the user's intent into a Markdown protocol containing the hypothesis,
-   method, exact conditions, repetitions, stopping rule, expected cost,
-   required evidence, and exclusions.
-2. Generate a JSON manifest on the user's behalf. The user never has to author
-   this internal form. Use schema version 1 and an explicit `conditions` list;
-   each condition has `id`, `description`, `required_runs`,
-   `expected_cost_usd`, `required_artifacts`, and `execution`.
-3. Manual execution is `{"mode":"manual"}`. Local execution uses an explicit
-   argv array, cwd, string environment additions, timeout, accepted exit codes,
-   and declared output files. Never encode a shell command string.
-4. Store the draft with:
-
-   ```bash
-   ongo experiment create --document PLAN.md --manifest MANIFEST.json
-   ```
-
-5. Present the canonical matrix returned by
-   `ongo experiment show <id> --format markdown` or render a local web view with
-   `ongo experiment render <id> --out <dir>`. The matrix, not the prose alone,
-   is what will execute.
-
-Once an attempt begins, the plan is frozen. A changed protocol is created with
-`--successor-of <old-id>` and must be reviewed and approved independently.
-
-### Delegated approval
-
-A user may pre-authorize the driving agent by stating a principal, evidence
-pointer, per-experiment USD ceiling, optional cumulative ceiling, expiry, and
-allowed execution modes. Translate that explicit grant with:
-
-```bash
-ongo experiment delegate create --granted-by <principal> --evidence <pointer> \
-  --max-per-experiment-usd <amount> [--max-total-usd <amount>] \
-  --expires-at <ISO-8601> [--mode manual] [--mode local]
-```
-
-The driving agent may then approve an exact immutable plan on the user's behalf:
-
-```bash
-ongo experiment approve <id> --delegation <delegation-id> --actor <driver-label>
-```
-
-Zero-cost plans may omit `--delegation`. Never invent or widen a delegation.
-Workers do not approve plans. If approval or a new attempt exits with code 5,
-return the budget/authorization discrepancy to the user before doing work.
-
-### Execute and verify
-
-- Manual work: `ongo experiment begin <id> --worker <label>` chooses the next
-  planned condition. Give that exact returned assignment to the worker. Submit
-  its result with `ongo experiment finish <attempt-id> --result RESULT.json
-  --artifact NAME=PATH`. Do not choose a condition independently.
-- Local work: `ongo experiment run <id>` executes eligible argv conditions
-  serially, captures their complete evidence, and continues to untouched
-  conditions after a failed command.
-- A failed or invalid observation does not satisfy coverage. Use
-  `ongo experiment retry <id> --condition <condition-id> --worker <label>` only
-  after a deliberate retry decision; retries are never automatic.
-- Cancel interrupted work explicitly with
-  `ongo experiment cancel <attempt-id> --reason <text>`.
-- Record protocol difficulties, deviations, observations, and interpretation as
-  append-only Markdown with `ongo experiment note add <id> --actor <label>
-  (--text <markdown> | --file NOTE.md)`. A note targets the experiment by
-  default; use `--condition <condition-id>` or `--attempt <attempt-id>` for a
-  narrower target. Use repeatable `--topic <topic-id-or-key>` only for existing,
-  unambiguous Ken `topic` publications, and use `--operation-key <key>` when a
-  retry-safe caller operation is available. Review the record with
-  `ongo experiment note list <id> --format markdown`.
-- Notes are documentary and never alter the frozen plan, approval, budget,
-  attempt result, or coverage. If a deviation invalidates an observation, set
-  `valid_observation` to `false` in the attempt result as well as explaining why
-  in a note; a note alone cannot invalidate or validate an attempt.
-- Always finish with `ongo experiment verify <id> --json`. Exit code 6 means
-  planned coverage remains incomplete; report the stored discrepancy instead
-  of declaring completion from memory.
-
-Experiment artifacts, including binary content, are immutable Ken publications.
-The public site shows an experiment only after an explicit `ongo-web` marker;
-its notes appear within that experiment view and cannot be published as
-standalone resources. Artifact publications require their own markers.
-
-## Auto-Expansion
-
-**Delegate to an intelligent subagent** using the most capable available model. The main loop stays lean — it only picks a topic, checks memory, and launches the agent. The subagent self-loads its own context from kendb.
-
-**CRITICAL — Memory check before spawning subagents**: Before launching ANY subagent (auto-expansion or user-triggered), check available free memory via `free -m | awk '/^Mem:/ {print $7}'` (returns available MiB).
-
-Three thresholds:
-- **≥ 1024 MiB free**: normal operation, spawn any subagent (Sonnet or Opus).
-- **512–1023 MiB free**: memory pressure. Prefer Sonnet (smaller footprint) over Opus. Skip passive auto-expansion this tick; only honor user-triggered requests.
-- **< 512 MiB free**: critical. Do NOT spawn any subagent. Send `_[ongo] Memory pressure (< 512 MiB free) — deferring all subagent launches until next tick._` and skip the expansion step entirely for both user requests and passive research.
-
-**Re-tier up when pressure loosens**: these thresholds are checked *every* tick, not sticky. When free memory rises back above a threshold, resume normal operation for that tier on the very next tick — do not stay degraded after the pressure clears. The goal is to gate spawns by current conditions, not to lock ongo into a conservative mode after one bad reading.
-
-Rationale: subagents (especially Opus) have substantial memory footprints. Running under memory pressure risks OOM, which kills the whole session and breaks the loop. The loop must never stop — it is better to skip a tick than crash the agent.
-
-1. **Memory check**: `free -m | awk '/^Mem:/ {print $7}'` — apply the three-threshold rule above. Skip or downgrade as required.
-2. Load only the topic list and exploration directives (lightweight):
-   ```bash
-   $KEN list --kind ongo-exploration
-   $KEN list --kind topic
-   ```
-3. Pick a topic **randomly**, weighted by `ongo-exploration` directives. Skip if no topics.
-4. **Launch a subagent** (via the Agent tool with the appropriate model for the current memory tier and `run_in_background: true`) whose prompt contains:
-   - The topic title and ID
-   - The ken binary path: `$KEN`
-   - The clacks channel ID
-   - The **self-contextualization instructions** below
-   - The **subagent identifier** — the short id returned by the Agent tool — so the subagent can prefix its own Slack posts with `[ongo, <id>]`. Pass the id explicitly in the prompt; do not rely on the subagent inferring it from context.
-!`d="${CLAUDE_SKILL_DIR:-$(([ -d "$HOME/.claude/skills/ongo" ] && echo "$HOME/.claude/skills/ongo") || (ls -d "$HOME"/.claude/plugins/cache/ongo/ongo/*/skills/ongo 2>/dev/null | sort -V | tail -1))}"; "$d/scripts/print-style.sh" dispatch-bullet`
-
-   **Immediately after the Agent tool returns**, the loop posts a spawn announcement to Slack:
-
-   ```bash
-   clacks send -c "$CHANNEL" -m "[ongo] Spawning subagent <id> for: <one-line task summary>"
-   ```
-
-   The announcement must use the loop's `[ongo]` prefix (not `[ongo, <id>]`) because the loop, not the subagent, is the speaker. The id must be the exact value passed to the subagent so that the subagent's later posts can be matched to this announcement. The announcement is sent **before** the loop continues with any other work — even if the loop will go on to spawn a second subagent in the same tick, each spawn is announced individually before the next is launched.
-
-**Subagent self-contextualization instructions** (include verbatim in the prompt, with `SUBAGENT_ID` replaced by the actual id returned by the Agent tool):
-
-> You are an ongo research expansion agent. Your subagent id is `SUBAGENT_ID`. Every Slack message you post in this run **must** start with the literal prefix `[ongo, SUBAGENT_ID]` (no leading space, no markdown wrapper before the prefix). This prefix is what the ongo poll filter uses to recognise your messages as bot traffic; messages without it will be re-processed as user messages and may trigger an infinite loop. The italics-wrapped variant `_[ongo, SUBAGENT_ID] … _` is also accepted by the filter.
->
-!`d="${CLAUDE_SKILL_DIR:-$(([ -d "$HOME/.claude/skills/ongo" ] && echo "$HOME/.claude/skills/ongo") || (ls -d "$HOME"/.claude/plugins/cache/ongo/ongo/*/skills/ongo 2>/dev/null | sort -V | tail -1))}"; "$d/scripts/print-style.sh" subagent-paragraph`
->
-> Before doing any research, build your context from kendb:
->
-> 1. Run `KEN list --kind topic` to see all topics and their IDs.
-> 2. Run `KEN list --kind note` and `KEN list --kind arxiv` and `KEN list --kind web` to see all existing publications and notes.
-> 3. Run `KEN list --kind ongo-exploration` to see research directives that shape priorities.
-> 4. Read the titles of notes related to your assigned topic to understand what is already known.
->
-> Then act as a **research analyst**:
-> - Identify gaps in the existing knowledge for this topic.
-> - Search the web for new work, recent papers, and developments.
-> - Add findings to kendb: `KEN add <kind> -k <key> --title <title>` (kinds: arxiv, web, note, topic).
-> - Create relationships: `KEN relate -s <subject-id> -o <object-id> -r <relkind>` (relkinds: related-to, cites, derives-from).
-> - Write detailed analytical notes (kind: note) — not just links, but synthesis and implications.
-> - Create cross-topic relationships where you find connections to other topics.
-> - Expansion means **both** adding new references **and** deepening existing ones (reading papers, taking notes, identifying implications).
->
-> **Sign-off (mandatory).** Before you return, post exactly one final Slack message — your sign-off — via:
-> `clacks send -c "CHANNEL" -m "[ongo, SUBAGENT_ID] Done — <one-line summary of what you produced> <URL or artifact pointer if any>"`
->
-> The sign-off is what tells the loop and the user that your run finished normally. A subagent that returns without a sign-off is treated as having crashed silently. Do not send the sign-off in the body of an intermediate post — it must be its own message, with its own `[ongo, SUBAGENT_ID]` prefix, sent immediately before you return.
->
-> (Replace KEN and CHANNEL with the actual paths/IDs provided. `SUBAGENT_ID` is provided to you in this prompt and must be used verbatim.)
-
-5. Continue the main loop immediately — do NOT wait for the expansion agent to finish.
-
-### Daily arxiv sweep
-
-Ongo watches user-seeded topics for fresh arxiv preprints on a 24h cadence via `ongo arxiv sweep`. This runs alongside — not instead of — directive-weighted auto-expansion: expansion synthesises across kendb; the arxiv sweep only pulls in raw new preprints matching a topic's `search_query` and stashes them in kendb so later expansion runs can read/relate them.
-
-**Seeding topics.** The user (or ongo itself, during a self-improvement cycle) seeds interests as `ongo-arxiv-topic` publications. Key = short slug (`distributional-rl`, `lora-fine-tune`), title = an arxiv API `search_query` expression (`all:"distributional reinforcement learning"`, `cat:cs.LG AND all:"LoRA"`), notes = free-form context on why the topic matters. `ongo setup` already guarantees the kind exists:
-
-```bash
-$KEN add ongo-arxiv-topic -k <slug> --title '<search_query>'
-```
-
-**Tick-loop hook.** After the auto-expansion / self-improvement checks in each tick: if `time.time() - state["last_arxiv_daily"] >= 86400` AND `status == "ok"` AND `mode == "normal"`, run:
-
-```bash
-ongo arxiv sweep --channel "$CHANNEL"
-```
-
-Then update `state["last_arxiv_daily"]` to the current unix epoch and write state back. Run in the foreground if it returns quickly (a few topics, a handful of new papers per topic); if the topic count grows large, dispatch as a background subagent to keep the tick lean — same memory-tier gate as auto-expansion. Skip on `status == "error"` (rate-limit / API error) and while `mode == "fast"` (a live conversation must not be delayed by network fetches). Initial state ships `"last_arxiv_daily": 0` so the very first eligible tick runs a sweep.
-
-**What the sweep does.** For each `ongo-arxiv-topic` seed the command HTTP-GETs `http://export.arxiv.org/api/query?search_query=<title>&sortBy=submittedDate&sortOrder=descending&max_results=<limit>` (stdlib `urllib` only — no `requests` / `feedparser`), parses the Atom feed with `xml.etree.ElementTree`, drops entries older than `--window-hours` (default 26; 2h overlap protects a slightly late cron), and dedups against existing `arxiv` publications (bare ids, with `arXiv:` and trailing `vN` removed). Each new paper, abstract note, topic relationship, and note body is committed through one atomic `ken load` transaction. A digest is posted to `$CHANNEL` only if at least one new paper lands. The command prints `{topics, new, posted, errors}` JSON for the tick logger.
-
-**Options.** `--dry-run` (no ken writes, no Slack — prints the summary), `--no-slack` (write to kendb but skip the digest), `--limit N` (results per topic per query, default 25), `--window-hours H` (default 26). Per-topic HTTP failures continue to the next topic and are surfaced in the summary; exit 3 if every topic errored or Ken is unavailable.
-
-**Digest publication (`ongo-digest`).** After the sweep, if ≥ 1 new paper landed, the script publishes exactly one `ongo-digest` publication summarising that run: key = ISO date (`YYYY-MM-DD`), title = per-topic paper counts, body (attached via a related-to `note`, mirroring the arxiv-abstract pattern) = markdown paper list grouped by topic with abstract links. Same-day re-runs (dev/testing) key on `YYYY-MM-DD-HH:MM` to avoid collisions. `ongo site build` surfaces these on a dedicated **Digests** tab (`digests.html`) with per-digest detail pages under `items/<slug>.html` — first-class site view, **no `ongo-web` marker required**: any `ongo-digest` publication is automatically web-visible. Empty sweeps (`new: 0`) do not create a digest publication.
-
-#### How topics are chosen
-
-Topics live in kendb as `ongo-arxiv-topic` publications. Each has a slug key, an arxiv-API `search_query` title, and free-form context notes. There is no ranking or weighting — the sweep iterates over every active topic on every tick.
-
-- **Manual seeding (primary path).** After `ongo setup`, the user registers a topic:
-  ```bash
-  $KEN add ongo-arxiv-topic -k distributional-rl --title 'all:"distributional reinforcement learning"'
-  $KEN add ongo-arxiv-topic -k lora --title 'cat:cs.LG AND all:"low-rank adaptation"'
-  ```
-  Any arxiv-API [search_query expression](https://info.arxiv.org/help/api/user-manual.html#query_details) works (`all:`, `ti:`, `abs:`, `au:`, `cat:` combined with `AND`/`OR`). The slug is what shows up in per-topic headings in the digest.
-- **Selection at run time.** On each 24h sweep tick, `ongo arxiv sweep` iterates over EVERY active `ongo-arxiv-topic` publication — no ranking or weighting. One arxiv-API query per topic per run. Dedup happens per-topic and across the union of all existing `arxiv` publications (bare id, `arXiv:` prefix and trailing `vN` versions stripped).
-- **Curation.** Users prune stale topics with `ongo ken delete pub --key <slug>` (or `ongo ken delete pub --kind ongo-arxiv-topic` with `--dry-run` first for a bulk sweep). The daily sweep does not auto-retire topics; retirement is an explicit user action.
-- **Relationship to `ongo-exploration`.** The older `ongo-exploration` pubkind steers auto-expansion topic choice for the deep-notes rotation (Tick step 7). `ongo-arxiv-topic` is a separate mechanism specifically for the daily preprint sweep — the two do not interact today: an `ongo-exploration` directive does not influence arxiv topic weighting, and an `ongo-arxiv-topic` seed does not steer auto-expansion.
-
-## Self-Improvement
-
-Every 24h or on request. Five layers, all run together:
-
-### A. kendb maintenance
-
-- **Dedup** by key/URL/arxiv ID — use `ongo ken delete` to remove duplicates after identifying them. Preview with `--dry-run` first, then delete the duplicate publication(s) keeping the one with richer notes/relationships.
-- **Gap filling** — implied relationships (depth 1, cap 20 per cycle)
-- **Surveys** — summary notes for topics with many publications
-- **Importance** — topic centrality by connection count
-- **Kind evolution** — new `pubkind` if needed
-- **Stale directives** — review `ongo-exploration`, flag outdated on Slack. Use `ongo ken delete pub --kind ongo-exploration` (with `--dry-run` first) to remove directives that are no longer relevant, or `ongo ken delete pub <id>` to remove individual stale entries.
-- **Regenerate the published site** — run `ongo site build` to rebuild the static site from the `ongo-web` publish set. Access is resolved per resource: unassigned resources stay public and resources with effective `ongo-readable-by` keys are encrypted. Public-only builds remain deterministic; builds containing protected resources use fresh nonces. Both rewrite the output dir cleanly. Hosting is self-served (`ongo site serve`) on the user's own server; **DNS is the user's manual step — ongo never performs DNS or deploys.**
-
-### B. Dependency updates
-
-Run `ongo doctor --json` to verify the pinned Ken v3 runtime. Do not upgrade Ken
-independently of the Ongo plugin pin; a newer upstream Ken release is an input
-to a future Ongo release, not an in-place self-update. Report failures on Slack.
-
-Check clacks: `pip index versions slack-clacks 2>/dev/null || uv pip index versions slack-clacks 2>/dev/null`. If newer, upgrade. Report on Slack.
-
-### C. Upstream sync
-
-Merge latest upstream SKILL.md into local copy, preserving local improvements.
-
-1. `gh api repos/zomglings/ongo/contents/plugins/ongo/skills/ongo/SKILL.md --jq '.content' | base64 -d > ${CLAUDE_SKILL_DIR}/SKILL.md.upstream`
-2. `diff ${CLAUDE_SKILL_DIR}/SKILL.md ${CLAUDE_SKILL_DIR}/SKILL.md.upstream` — if identical, `rm` and skip.
-3. Read both files. Identify upstream additions, local improvements, and conflicts.
-4. Apply upstream additions while keeping local changes. On conflict, prefer local but note upstream intent.
-5. `$KEN add ongo-self-improvement -k "$(date +%s)-upstream-sync" --title "Merged upstream SKILL.md changes"`
-6. Report: `_[ongo] Synced upstream changes from zomglings/ongo_`
-7. `rm ${CLAUDE_SKILL_DIR}/SKILL.md.upstream`
-
-### D. Self-modification
-
-Review past attempts: `$KEN list --kind ongo-self-improvement`
-
-(Run `ongo setup` before every `ongo-self-improvement` or `ongo-cron-reset` write so a fresh tick cannot target an uninitialized database.)
-
-1. Record plan: `$KEN add ongo-self-improvement -k "<timestamp>-<label>" --title "<what will change>"`
-2. Backup: `cp ${CLAUDE_SKILL_DIR}/SKILL.md ${CLAUDE_SKILL_DIR}/SKILL.md.bak`
-3. Reflect and edit. Only modify `${CLAUDE_SKILL_DIR}/SKILL.md`.
-4. Record outcome as a note on the publication.
-5. Report: `_[ongo] Self-update: <what changed>_`
-6. If next tick fails to parse, restore from backup.
-
-### E. Upstream contributions
-
-File issues/PRs against tools (ken, clacks, etc.) when you hit bugs or missing features. Track as `ongo-self-improvement` entries keyed by issue/PR URL. On subsequent cycles, check status via `gh issue view`/`gh pr view` and update notes. Record rejection reasons to inform future attempts.
-
-**Constraints**: Do not remove shutdown commands, remove error handling, weaken the `ts > LAST_USER_TS` user-message gate or advance it on bot traffic, bypass `ongo slack poll`, or modify these constraints.
-
-## Message Format
-
-Every message ongo or any ongo-spawned subagent posts to Slack **must** carry a bracketed identity prefix; the poll filter uses that prefix to distinguish bot traffic from user traffic, and a missing or malformed prefix is what causes the loop to re-process its own messages and run away. Two prefixes are valid:
-
-- **`[ongo]`** — used by the main tick loop for status messages, user replies, and shutdown notices.
-- **`[ongo, <subagent-id>]`** — used by every subagent spawned by the loop. `<subagent-id>` is the short identifier returned by the Agent tool (or the abbreviation the loop adopts when announcing the spawn, see Auto-Expansion step 4). This makes it possible to attribute a Slack message to the specific subagent that produced it, including when several subagents post concurrently.
-
-The poll filter in `ongo slack poll` recognises both forms (it accepts `[ongo]`, `[ongo,`, `[ongo:`, and the italics-wrapped `_[ongo]…` / `_[ongo,…` / `_[ongo:…` variants). Anything that does **not** start with one of those patterns is treated as a user message and routed back into the tick loop — including a stray `[Ongo]` (wrong case), `[ ongo]` (leading space inside the bracket), or `(ongo)` (wrong bracket). Spawn-time announcements from the loop, status updates from subagents, and the subagent's sign-off message all share the same prefix rule.
-
-**Subagent lifecycle messages.** The loop and the subagent jointly post three messages per spawn so the user always sees a complete arc:
-
-1. **Spawn announcement** — the loop, immediately after the Agent tool returns the subagent id, posts `[ongo] Spawning subagent <id> for: <task summary>`. The user sees the id at the moment of creation; if the run later misbehaves the id is already pinned in the channel.
-2. **Mid-run posts** (optional, but recommended for long-running work) — the subagent posts `[ongo, <id>] <progress>` whenever it would otherwise be useful to surface a milestone.
-3. **Sign-off** — the subagent posts a single `[ongo, <id>] Done — <one-line summary> [<URL or artifact pointer if any>]` immediately before it returns. The sign-off is mandatory; a subagent that exits without one is treated as having crashed silently, and the loop will note this on the next tick if the absence is detected. The loop never posts the sign-off on the subagent's behalf — it must come from the subagent itself so it carries the subagent's id.
-
-Other constraints:
-
-- Truncate responses over 30000 chars. Use `_..._` for italic status messages (the underscore wrapper around the whole message is allowed and the poll filter still matches via the `_[ongo`… prefixes).
-- The prefix is matched as a literal string at the very start of the message text. A message that starts with leading whitespace, a markdown bullet, or a code fence is no longer prefixed and will be eaten by the poll filter — write the prefix as the first characters of the message body.
-
-## kendb Management Tools
-
-### ongo ken delete
-
-`ongo ken delete` — delete publications and relationships from kendb. This is a stopgap until ken gains native delete support.
-
-```
-ongo ken delete pub <id>              # Delete a publication (+ its relationships and notes)
-ongo ken delete pub --key <key>       # Delete by key (URL, DOI, path, etc.)
-ongo ken delete pub --kind <kind>     # Delete all publications of a kind
-ongo ken delete rel <id>              # Delete a single relationship
-ongo ken delete --dry-run ...         # Preview without deleting
-```
-
-Always use `--dry-run` first when deleting by `--kind` to avoid accidentally removing wanted entries. The script handles the ON DELETE RESTRICT constraint on relationships by deleting them before the publication.
-
-### Static site
-
-The `ongo-web` publication kind is the **publish marker**: an `ongo-web`
-entry's key = the target note/publication id (or its key), title = the
-display/nav label. Research notes, experiments, results, and artifacts appear
-only when an `ongo-web` entry references them, so that published surface is
-explicit and queryable. Daily `ongo-digest` publications are the sole automatic
-site collection. Mark a note for publish after `ongo setup`:
-
-```bash
-$KEN add ongo-web -k "<note-id>" --title "<nav title>"
-```
-
-`ongo site build` generates a self-contained static site
-(default `./site/`) from the publish set: a reverse-chronological index,
-plus per-item HTML pages with an embedded CSS
-theme and no external assets. A public-only build is stdlib-only, idempotent,
-and deterministic. A build containing protected resources uses the pinned
-`cryptography` dependency installed by `ongo setup` and fresh AES-GCM nonces;
-it remains idempotent in meaning but is intentionally not byte-deterministic.
-The site **regenerates each self-improvement cycle** (see
-Self-Improvement layer A). Source bodies resolve in order: a filesystem
-`.md`/`.pdf`/`.tex` named by the publication key, a slug match under the
-note roots, the kendb note body read via `ken show --json` (**Ken v3**,
-enforced by `ongo setup`), or finally the title. Cross-links between
-published notes resolve to their pages; links to unpublished notes degrade
-to plain text so unpublished content is never leaked.
-
-The **Experiments** tab contains only experiment roots with their own explicit
-`ongo-web` marker. It renders the reviewed protocol and canonical manifest.
-Attempts, results, and artifacts do not inherit that marker; each artifact
-requires its own `ongo-web` marker before it can appear anywhere on the site.
-
-### Per-resource protected publishing
-
-Protection belongs to a published resource, not to the site as a whole. The
-same generated site may contain public notes, protected notes, public
-experiments, and protected experiments. An `ongo-readable-by` relationship
-from a resource to an `ongo-access-key` descriptor makes that resource
-available under the corresponding symmetric key. Several relationships create
-several AES-256-GCM ciphertext variants under one resource identity; the
-browser displays the resource once and reports every locally named key that
-unlocked it. Key descriptors and policy live in Ken; secret material never
-does.
-
-Manage administrator keys only through the CLI:
-
-```bash
-ongo key create --label "Work" --scope all       # all current/future content
-ongo key create --label "Snapshot" --scope published
-ongo key create --label "Project" --scope empty
-printf '%s\n' "$ONGO_SHARED_CAPABILITY" | ongo key import --label "Imported" --scope empty
-ongo key grant <key-id> <publication-id>
-ongo key list
-ongo key export <key-id>
-```
-
-`key import` reads the capability from standard input or a hidden interactive
-prompt. Never place literal capability material in command arguments or shell
-history.
-
-`--scope published` materializes grants for the current `ongo-web` targets and
-digests. `--scope empty` protects only resources granted later. `--scope all`
-is an effective default for every current and future published resource. If a
-resource has no effective key, it retains the existing public behavior.
-Digest bodies are derived from related notes. When a related source note is
-protected, grant the digest a non-broader subset of the source's keys; site
-generation rejects incompatible policies rather than exposing the copied body.
-
-The browser's **Keys** panel accepts the capability returned by `key create` or
-`key export`, lets the reader choose a local label, and stores the capability
-in browser local storage. Titles, bodies, dates, tags, experiment protocols,
-and artifacts for protected resources exist in the static output only inside
-AES-GCM ciphertext. The client tries registered keys, displays inaccessible
-resources as generic encrypted entries, and deduplicates successful variants.
-Never put a capability in Ken, Slack, a URL, generated output, or an Ongo log.
-The administrator keyring may be reached through symlinks but must not be
-hard-linked; the CLI rejects hard links to preserve atomic keyring updates.
-If browser storage is blocked, entered keys remain in memory for the current
-page session. Public resources still render without storage or Web Crypto.
-Public resources may retain remote HTTP(S) images. The builder removes remote
-images from protected resources so successful decryption cannot reveal access
-to a third-party image host; use relative or embedded data images instead.
-
-Protected resources require HTTPS in production because Web Crypto is a secure-
-context API. Build on a trusted machine and deploy only the generated static
-tree. A recipient can retain plaintext or a capability; static hosting cannot
-enforce expiration or revoke already downloaded ciphertext. A compromised
-host can replace the JavaScript and steal keys when a reader unlocks content.
-The generated manifest intentionally leaks resource count, article/experiment
-collection, ordering, stable opaque IDs, ciphertext sizes, and rebuild timing;
-it does not expose protected titles, dates, tags, bodies, or key labels.
-
-**Regeneration is staged and recoverable.** The generator builds a complete
-tree in a uniquely reserved sibling temp directory, moves the prior tree into
-a separately reserved sibling backup, and renames the new tree into place. If
-the second rename fails, it restores the prior tree. No half-written tree is
-served, though a request in the very small interval between the two directory
-renames may receive a transient miss. The long-lived `ongo site serve` process
-does not need a restart after regeneration.
-
-`ongo site serve` serves the generated directory via
-`python3 -m http.server` (default `0.0.0.0:80`). Hosting is
-**self-served on the user's own server** (see `deploy/README.md` and the
-`deploy/ongo-site.service` systemd template). The user points DNS
-(`ongo.ergodic.xyz`) at their server **manually** — the skill must never
-perform DNS changes or deploys.
+Set `idle` and the normal interval from the user's arguments. Write state with a
+temporary sibling plus atomic rename; never partially overwrite it. Then follow
+the selected host adapter to create the scheduler and record its returned ID.
+
+## Run one tick
+
+Treat these steps as the shared correctness contract for every scheduler:
+
+1. Read and validate `STATE_PATH`. If the scheduler ID is null, do not guess;
+   re-run startup or report the incomplete setup.
+2. Apply the host adapter's stale-scheduler reconciliation or update rules.
+3. Poll Slack with `"$ONGO" slack poll "$CHANNEL" "$LAST_USER_TS"`. When
+   `speaker_prefix` is non-empty, append
+   `--speaker-prefix "$SPEAKER_PREFIX"`.
+4. Check `status` before interpreting the message count.
+   - `error`: post an Ongo-prefixed failure notice, leave `last_user_ts`
+     unchanged, skip expansion and cadence counters, apply rate-limit backoff,
+     and end the tick.
+   - `ok`: process the returned window.
+5. If `user_count > 0`, acknowledge processing and handle every message in
+   ascending timestamp order. Answer it inline or successfully dispatch it to
+   one writer. Do not skip messages.
+6. Advance `last_user_ts` only to the last message in the longest fully handled
+   ascending prefix. Never advance past a failed or undispatched message, and
+   never advance from bot traffic.
+7. If the successful poll is empty and the loop is not idle, run at most one
+   auto-expansion unit from [references/research.md](references/research.md).
+8. When due and not rate-limited or in fast mode, run the daily arXiv sweep and
+   the safe maintenance cycle from the research reference.
+9. Apply the host adapter's fast-mode rule: activity requests a one-minute
+   cadence; five successful empty fast polls request the normal cadence.
+10. Atomically persist the updated state.
+
+`ongo slack poll` follows every Slack cursor page, returns no partial window on
+failure, filters only configured Ongo speaker forms, deduplicates by timestamp,
+and sorts ascending. Do not replace it with direct `clacks read` calls.
+
+## Process messages
+
+Interpret Slack messages as natural language:
+
+- Research: search authoritative sources, add references and analytical notes
+  to Ken, relate them, and report failures without hiding partial work.
+- Ken management: inspect or update publications and relationships through Ken.
+- Exploration strategy: create or revise `ongo-exploration` publications.
+- Experiments: read [references/experiments.md](references/experiments.md)
+  completely and use only `ongo experiment` for experiment state.
+- Publishing or access keys: read
+  [references/publishing.md](references/publishing.md) completely.
+- Maintenance: use the bounded, non-destructive maintenance rules in the
+  research reference.
+
+Quick questions may be answered inline. Delegate heavyweight research when the
+host supports subagents, but enumerate write targets first and keep at most one
+writer per file, publication key, state file, or Slack response stream. Send new
+instructions for an in-flight artifact to its existing writer instead of
+starting a competing writer.
+
+If `writing-style.md` exists beside this file, run
+`scripts/print-style.sh section` and follow the returned style instructions.
+Pass the same style block to every prose-writing subagent.
+
+## Message identity
+
+Every Slack message sent by Ongo begins with the configured `speaker_prefix`
+followed immediately by one of:
+
+- `[ongo]` for the main loop.
+- `[ongo, <agent-id>]` for a delegated agent.
+
+The marker must be the first content after the optional speaker prefix. Preserve
+case and brackets. Use the same `speaker_prefix` in `ongo slack poll`; otherwise
+the poller deliberately treats the prefixed message as user input.
+
+For each delegated run, the loop posts a spawn announcement, the agent may post
+progress, and the agent posts one final `Done` sign-off. Pass the exact agent ID
+to its prompt. Truncate Slack responses over 30,000 characters.
+
+## Stop safely
+
+Treat `/quit`, `/stop`, and `/exit` received through the configured Slack
+channel as explicit shutdown requests. Post the shutdown message, follow the
+host adapter's scheduler deletion procedure, verify no Ongo scheduler remains,
+and preserve the research database and state file for inspection. Never infer a
+shutdown from silence, context pressure, or a polling error.
+
+## Non-negotiable invariants
+
+- Never advance the Slack cursor past an unhandled message.
+- Never treat a failed poll as an empty successful poll.
+- Never let two agents write the same artifact concurrently.
+- Never use direct Ken or SQLite mutation for experiment publication kinds.
+- Never put access capabilities in Ken, Slack, URLs, logs, or command arguments.
+- Preview bulk deletion before executing it.
+- Do not upgrade dependencies, edit an installed plugin cache, delete research,
+  or create external issues or pull requests without explicit authorization.
+- Preserve scheduler continuity: create before delete on Claude Code; update the
+  existing heartbeat on Codex.

@@ -1,4 +1,4 @@
-"""Top-level command dispatcher for the Ongo Claude Code plugin."""
+"""Top-level command dispatcher for the Ongo research plugin."""
 
 from __future__ import annotations
 
@@ -14,13 +14,14 @@ import tempfile
 from pathlib import Path
 
 from . import __version__
-from . import arxiv, delete, serve, site, slack
+from . import arxiv, delete, serve, site, skill, slack
 from .errors import OngoArgumentParser, OngoError, emit_error, emit_json
 from .ken import (
     KEN_DB_VERSION,
     PUBLICATION_KINDS,
     RELATIONSHIP_KINDS,
     KenClient,
+    agent_state_path,
     default_data_dir,
     install_ken,
 )
@@ -30,7 +31,9 @@ HELP = """usage: ongo <command> [options]
 
 Commands:
   setup                 Install and initialize pinned dependencies
-  doctor [--json]       Check the Claude Code plugin runtime
+  doctor [--json]       Check the plugin runtime (`--no-slack` for one-shot use)
+  skill --harness {claude,codex}
+                        Render the skill for one agent harness
   slack poll            Poll Slack using Ongo's gap-free cursor contract
   arxiv sweep           Import the daily arXiv topic sweep
   site build            Build the static Ongo research site
@@ -228,6 +231,7 @@ def setup_main(argv):
             "ken": binary,
             "db": client.db,
             "cryptography": cryptography,
+            "state": str(agent_state_path()),
             "version": __version__,
         }
     )
@@ -255,6 +259,7 @@ def doctor_main(argv):
 
     parser = OngoArgumentParser(prog="ongo doctor")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--no-slack", action="store_true")
     parser.add_argument("--ken")
     parser.add_argument("--db")
     args = parser.parse_args(argv)
@@ -263,9 +268,10 @@ def doctor_main(argv):
         "plugin_data": {"ok": False, "path": str(default_data_dir())},
         "ken": {"ok": False},
         "database": {"ok": False},
-        "clacks": clacks_version(),
         "cryptography": installed_cryptography(),
     }
+    if not args.no_slack:
+        checks["clacks"] = clacks_version()
     data_dir = default_data_dir()
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -323,6 +329,8 @@ def dispatch(argv):
         return setup_main(rest)
     if command == "doctor":
         return doctor_main(rest)
+    if command == "skill":
+        return skill.main(rest)
     if command == "slack" and rest[:1] == ["poll"]:
         return invoke("slack-poll", slack.main, rest[1:])
     if command == "arxiv" and rest[:1] == ["sweep"]:

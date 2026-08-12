@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import contextlib
+import io
 import subprocess
 import sys
 import unittest
@@ -101,6 +103,36 @@ class SlackPollTests(unittest.TestCase):
         self.assertEqual(result["error"], "ratelimited")
         self.assertEqual(result["total_seen"], 0)
         self.assertEqual(result["user_messages"], [])
+
+    def test_configured_speaker_prefix_filters_host_identity(self):
+        messages = [
+            message(1, "`[rex]` [ongo] status"),
+            message(2, "`[rex]` [ongo, agent-1] Done"),
+            message(3, "a real request"),
+        ]
+        with mock.patch.object(slack.subprocess, "run", return_value=page(messages)):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(
+                    slack.main(
+                        [
+                            "C123",
+                            "1700000000.000000",
+                            "--speaker-prefix",
+                            "`[rex]` ",
+                        ]
+                    ),
+                    0,
+                )
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["user_count"], 1)
+        self.assertEqual(result["user_messages"][0]["text"], "a real request")
+
+    def test_unconfigured_speaker_prefix_is_not_silently_trusted(self):
+        messages = [message(1, "`[rex]` [ongo] user-supplied text")]
+        with mock.patch.object(slack.subprocess, "run", return_value=page(messages)):
+            result = slack.poll("C123", "1700000000.000000")
+        self.assertEqual(result["user_count"], 1)
 
 
 if __name__ == "__main__":

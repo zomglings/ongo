@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+ONGO_PLUGIN_ROOT=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
+exec "$ONGO_PLUGIN_ROOT/bin/ongo" "$@"
