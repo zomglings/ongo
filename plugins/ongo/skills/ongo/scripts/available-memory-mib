@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Print available memory in MiB on Linux or macOS, or `unknown`."""
+
+from __future__ import annotations
+
+import platform
+import re
+import subprocess
+from pathlib import Path
+
+
+MIB = 1024 * 1024
+
+
+def linux_available_memory():
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024 // MIB
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def macos_available_memory():
+    try:
+        result = subprocess.run(
+            ["vm_stat"], capture_output=True, text=True, timeout=5, check=True
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    size_match = re.search(r"page size of (\d+) bytes", result.stdout)
+    if size_match is None:
+        return None
+    page_size = int(size_match.group(1))
+    counts = {}
+    for line in result.stdout.splitlines():
+        match = re.match(r"Pages (free|inactive|speculative|purgeable):\s+(\d+)\.", line)
+        if match:
+            counts[match.group(1)] = int(match.group(2))
+    available_pages = sum(counts.values())
+    if available_pages == 0:
+        return None
+    return available_pages * page_size // MIB
+
+
+def main():
+    system = platform.system()
+    if system == "Linux":
+        available = linux_available_memory()
+    elif system == "Darwin":
+        available = macos_available_memory()
+    else:
+        available = None
+    print(available if available is not None else "unknown")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

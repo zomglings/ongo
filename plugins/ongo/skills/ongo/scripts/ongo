@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+ONGO_SCRIPT=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")
+ONGO_PLUGIN_ROOT=$(CDPATH= cd -- "$(dirname "$ONGO_SCRIPT")/../../.." && pwd -P)
+exec "$ONGO_PLUGIN_ROOT/bin/ongo" "$@"

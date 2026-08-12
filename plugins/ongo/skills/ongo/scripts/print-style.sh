@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
-# print-style.sh — emit writing-style content for SKILL.md inclusion.
+# print-style.sh — emit optional writing-style instructions.
 #
-# Called from SKILL.md via Claude Code's inline-command-substitution
-# syntax. All three call sites in SKILL.md are conditional on the
-# existence of ${CLAUDE_SKILL_DIR}/writing-style.md — if the file is
-# missing or empty, every mode of this script emits nothing and the
-# corresponding section, bullet, or paragraph vanishes from SKILL.md.
-# Transitivity is baked into the script (not into the user's style
-# file), so the same rule applies in every deployment regardless of
-# what their writing-style.md says.
+# Both Claude Code and Codex call this script explicitly after resolving the
+# installed skill directory. If writing-style.md is missing or empty, every
+# mode emits nothing.
 #
 # Modes (the first argument, default "section"):
 #
@@ -30,10 +25,10 @@ set -eu
 
 MODE="${1:-section}"
 
-# Resolve the skill root. Prefer the harness-supplied override; otherwise
+# Resolve the skill root. Prefer a Claude harness override; otherwise
 # fall back to this script's own parent directory (print-style.sh lives at
 # <skill-root>/scripts/print-style.sh). Lets the skill load even when the
-# Claude Code harness fails to export CLAUDE_SKILL_DIR.
+# the host does not export CLAUDE_SKILL_DIR.
 SKILL_DIR="${CLAUDE_SKILL_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 STYLE_FILE="$SKILL_DIR/writing-style.md"
 
@@ -46,9 +41,9 @@ case "$MODE" in
     cat <<'PROSE'
 ## Writing style
 
-A writing-style guide is configured at `${CLAUDE_SKILL_DIR}/writing-style.md`. Its contents are inlined below at skill-load time via Claude Code's `!\`command\`` inline command substitution (https://code.claude.com/docs/en/skills.md). Treat the inlined block as a controlling style guide for every piece of prose produced this tick — Slack replies, status messages, spawn announcements, sign-off relays.
+A writing-style guide is configured beside the installed Ongo skill. Treat the block below as controlling guidance for every piece of prose produced this tick — Slack replies, status messages, spawn announcements, and sign-off relays.
 
-The 4096-char ceiling on the inlined block is enforced by `head -c 4096` in the loader script.
+The loader enforces a 4096-character ceiling.
 
 ### Style block (verbatim from writing-style.md)
 
@@ -71,7 +66,7 @@ PROSE
 
   dispatch-bullet)
     cat <<'PROSE'
-- The **writing-style block**. At dispatch time, the loop re-reads the file with `head -c 4096 ${CLAUDE_SKILL_DIR}/writing-style.md` and embeds the output verbatim under a `## Writing style` heading near the top of the subagent prompt. The subagent reads it as a controlling style guide for everything it writes — and forwards the same block to any sub-subagents it spawns (see the subagent self-contextualization block below for the transitive-inheritance instruction).
+- The **writing-style block**. At dispatch time, the loop re-runs this script and embeds the returned block under a `## Writing style` heading near the top of the subagent prompt. The subagent treats it as controlling guidance and forwards the same block to any sub-subagents.
 PROSE
     ;;
 

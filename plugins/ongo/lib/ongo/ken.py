@@ -64,13 +64,18 @@ RELATIONSHIP_KINDS = {
 
 
 def default_data_dir():
-    configured = os.environ.get("ONGO_DATA_DIR") or os.environ.get("CLAUDE_PLUGIN_DATA")
-    if configured:
-        return Path(configured).expanduser()
-    xdg = os.environ.get("XDG_DATA_HOME")
+    for variable in ("ONGO_DATA_DIR", "CLAUDE_PLUGIN_DATA", "PLUGIN_DATA"):
+        configured = (os.environ.get(variable) or "").strip()
+        if configured:
+            return Path(configured).expanduser()
+    xdg = (os.environ.get("XDG_DATA_HOME") or "").strip()
     if xdg:
         return Path(xdg).expanduser() / "ongo"
     return Path.home() / ".local" / "share" / "ongo"
+
+
+def agent_state_path():
+    return default_data_dir() / "agent-state.json"
 
 
 def resolve_ken(explicit=None):

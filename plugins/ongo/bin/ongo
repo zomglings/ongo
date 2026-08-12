@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code plugin entry point for Ongo."""
+"""Plugin entry point for Ongo."""
 
 import os
 import sys
@@ -10,19 +10,18 @@ sys.path.insert(0, os.path.join(PLUGIN_ROOT, "lib"))
 
 
 def plugin_data_dir():
-    configured = os.environ.get("ONGO_DATA_DIR") or os.environ.get(
-        "CLAUDE_PLUGIN_DATA"
-    )
-    if configured:
-        return os.path.expanduser(configured)
-    xdg = os.environ.get("XDG_DATA_HOME")
+    for variable in ("ONGO_DATA_DIR", "CLAUDE_PLUGIN_DATA", "PLUGIN_DATA"):
+        configured = (os.environ.get(variable) or "").strip()
+        if configured:
+            return os.path.expanduser(configured)
+    xdg = (os.environ.get("XDG_DATA_HOME") or "").strip()
     if xdg:
         return os.path.join(os.path.expanduser(xdg), "ongo")
     return os.path.join(os.path.expanduser("~"), ".local", "share", "ongo")
 
 
 # `ongo setup` installs platform wheels here so the plugin can keep its only
-# non-stdlib Python dependency outside Claude's immutable plugin cache.
+# non-stdlib Python dependency outside the host's immutable plugin cache.
 sys.path.insert(0, os.path.join(plugin_data_dir(), "python"))
 
 from ongo.cli import main

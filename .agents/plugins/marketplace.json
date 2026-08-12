@@ -1,0 +1,20 @@
+{
+  "name": "ongo",
+  "interface": {
+    "displayName": "Ongo"
+  },
+  "plugins": [
+    {
+      "name": "ongo",
+      "source": {
+        "source": "local",
+        "path": "./plugins/ongo"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
