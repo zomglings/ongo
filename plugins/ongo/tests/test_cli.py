@@ -74,8 +74,16 @@ class CliTests(unittest.TestCase):
                 "excluded": ("references/codex.md", "heartbeat automation"),
             },
             "codex": {
-                "included": ("targets the **Codex** harness", "heartbeat automation"),
-                "excluded": ("references/claude-code.md", "CronCreate"),
+                "included": (
+                    "targets the **Codex** harness",
+                    "heartbeat automation",
+                    "## Migrate legacy state",
+                ),
+                "excluded": (
+                    "references/claude-code.md",
+                    "CronCreate",
+                    "read the Claude adapter's legacy-upgrade section",
+                ),
             },
         }
         for harness, expected in cases.items():

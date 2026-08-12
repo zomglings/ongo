@@ -80,10 +80,12 @@ otherwise store an empty string. The Ongo marker always follows it, for example
 space. Preserve Markdown or other formatting in the prefix exactly as it appears
 on Slack; a visually similar plain-text prefix is not equivalent.
 
-If `STATE_MIGRATION` is `migrated`, read the Claude adapter's legacy-upgrade
-section before creating or changing any scheduler. If `STATE_PATH` already
-exists, validate and resume it; never overwrite an existing cursor or scheduler
-ID during startup. Refresh `speaker_user_id` from the authenticated `USER_ID`.
+If `STATE_MIGRATION` is `migrated`, or the state has
+`scheduler.needs_prompt_upgrade: true`, follow the selected harness adapter's
+legacy-state migration guidance before creating or changing any scheduler. If
+`STATE_PATH` already exists, validate and resume it; never overwrite an existing
+cursor or scheduler ID during startup. Refresh `speaker_user_id` from the
+authenticated `USER_ID`.
 Only when no state exists, initialize the durable JSON state at `STATE_PATH`:
 
 ```json

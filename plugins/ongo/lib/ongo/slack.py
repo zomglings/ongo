@@ -145,7 +145,8 @@ def poll(channel, last_user_ts, speaker_prefix="", speaker_user_id=""):
         # [ongo, <id>] / [ongo:<id>] prefix; the italics-wrapped _[ongo…
         # variants are also bot-spoken. Text is forgeable, so a configured
         # speaker identity is trusted only when Slack also attributes the
-        # message to that authenticated user (or supplies bot/app metadata).
+        # message to that exact authenticated user. Third-party bot/app
+        # metadata does not identify Ongo and must not suppress a message.
         t = m.get("text", "").lstrip()
         if speaker_prefix:
             if not t.startswith(speaker_prefix):
@@ -159,13 +160,7 @@ def poll(channel, last_user_ts, speaker_prefix="", speaker_user_id=""):
         if not marker:
             return False
         if speaker_user_id:
-            trusted_sender = str(m.get("user") or "") == speaker_user_id
-            trusted_sender = trusted_sender or bool(
-                m.get("bot_id")
-                or m.get("app_id")
-                or m.get("subtype") == "bot_message"
-            )
-            return trusted_sender
+            return str(m.get("user") or "") == speaker_user_id
         return not speaker_prefix
 
     by_timestamp = {

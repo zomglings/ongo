@@ -7,6 +7,7 @@ for polling, cursor advancement, experiments, message identity, and safety.
 ## Contents
 
 - [Create the heartbeat](#create-the-heartbeat)
+- [Migrate legacy state](#migrate-legacy-state)
 - [Run and update it](#run-and-update-it)
 - [Delegate research](#delegate-research)
 - [Permissions and recovery](#permissions-and-recovery)
@@ -32,6 +33,22 @@ heartbeat prompt must:
 After creation, atomically store the returned automation ID, current epoch,
 `host: "codex"`, mode, and normal interval. Codex heartbeats do not use Claude's
 seven-day renewal or create-before-delete swap.
+
+## Migrate legacy state
+
+A state with `scheduler.needs_prompt_upgrade: true` came from an active 0.5.x
+Claude Code loop. Its scheduler IDs identify Claude jobs, not Codex automations.
+Do not create a Codex heartbeat while those jobs may still run. Have the user
+remove the recorded current and previous jobs in Claude Code and sweep any job
+whose prompt begins exactly `Run one ongo research agent tick.`. Confirm that
+cleanup before continuing.
+
+After cleanup, atomically clear the migrated scheduler IDs, set `host: "codex"`,
+and clear `needs_prompt_upgrade`. Then create one heartbeat through the normal
+Codex flow and record its returned ID. Preserve the migrated channel, Slack
+cursor, normal interval, mode, and research state throughout the handoff.
+When migration found no legacy scheduler ID and `needs_prompt_upgrade` is false,
+no Claude scheduler cleanup is required; proceed directly to heartbeat creation.
 
 ## Run and update it
 

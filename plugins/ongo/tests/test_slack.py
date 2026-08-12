@@ -153,6 +153,26 @@ class SlackPollTests(unittest.TestCase):
         )
         self.assertEqual(result["newest_user_ts"], "1700000000.000002")
 
+    def test_third_party_bot_metadata_does_not_bypass_speaker_identity(self):
+        messages = [
+            message(1, "`[rex]` [ongo] relayed request", user="U_APP", bot_id="B1"),
+            message(2, "`[rex]` [ongo] app request", user="U_APP", app_id="A1"),
+            message(3, "`[rex]` [ongo] bot request", subtype="bot_message"),
+            message(4, "`[rex]` [ongo] self status", user="U_SELF", bot_id="B_SELF"),
+        ]
+        with mock.patch.object(slack.subprocess, "run", return_value=page(messages)):
+            result = slack.poll(
+                "C123",
+                "1700000000.000000",
+                speaker_prefix="`[rex]` ",
+                speaker_user_id="U_SELF",
+            )
+        self.assertEqual(result["user_count"], 3)
+        self.assertEqual(
+            [item["ts"] for item in result["user_messages"]],
+            ["1700000000.000001", "1700000000.000002", "1700000000.000003"],
+        )
+
     def test_speaker_options_are_position_independent(self):
         arguments = (
             [
