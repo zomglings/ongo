@@ -108,6 +108,22 @@ For production, run it under systemd:
   capabilities before exec) — so the service binds :80 **without running
   as full root**. No reverse proxy is required for plain HTTP.
 
+### Access logs
+
+By default each request is printed to stderr (the journal, under systemd).
+`--access-log PATH` instead appends one Combined Log Format line per request
+(client, UTC time, request line, status, bytes sent, referer, user agent) to
+`PATH`; client-supplied fields are escaped so they cannot forge lines. The
+`deploy/ongo-site.service` template writes `/var/log/ongo/access.log` via
+`LogsDirectory=ongo`. Install the rotation policy alongside it:
+
+```bash
+sudo cp deploy/ongo-site.logrotate /etc/logrotate.d/ongo-site
+```
+
+It keeps 52 weekly compressed files. The server notices when logrotate moves
+the file and reopens it, so no restart or `copytruncate` is needed.
+
 A reverse proxy is optional for a public-only site. It is **required for a site
 containing protected resources**, because browser Web Crypto requires HTTPS
 (localhost is the development exception). Use it if you want HTTPS
