@@ -42,7 +42,19 @@ def _escape(value):
     return "".join(out)
 
 
-class AccessLogHandler(SimpleHTTPRequestHandler):
+class SiteHandler(SimpleHTTPRequestHandler):
+    """Static file handler that never generates directory listings.
+
+    Directories with an index.html are still served; others are 404 rather
+    than exposing the generated tree's file names.
+    """
+
+    def list_directory(self, path):
+        self.send_error(404, "File not found")
+        return None
+
+
+class AccessLogHandler(SiteHandler):
     """Static file handler that writes Combined Log Format lines to a logger.
 
     The line is written once the request finishes, so the byte count comes
@@ -126,7 +138,7 @@ def make_server(site_dir, host, port, access_log=None):
             access_logger=open_access_log(access_log),
         )
     else:
-        handler = partial(SimpleHTTPRequestHandler, directory=site_dir)
+        handler = partial(SiteHandler, directory=site_dir)
     return ThreadingHTTPServer((host, port), handler)
 
 

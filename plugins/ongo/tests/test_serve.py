@@ -106,6 +106,35 @@ class AccessLogTests(unittest.TestCase):
         self.assertEqual(len(self.log.with_suffix(".log.1").read_text().splitlines()), 1)
 
 
+class DirectoryListingTests(unittest.TestCase):
+    def test_directories_without_index_are_not_listed(self):
+        for access_log in (False, True):
+            with self.subTest(access_log=access_log), tempfile.TemporaryDirectory() as temporary:
+                site = Path(temporary) / "site"
+                (site / "items").mkdir(parents=True)
+                (site / "items" / "secret-name.html").write_text("x", encoding="utf-8")
+                (site / "index.html").write_text("home", encoding="utf-8")
+                log = str(Path(temporary) / "access.log") if access_log else None
+                server = serve.make_server(str(site), "127.0.0.1", 0, log)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    statuses = {}
+                    for path in ("/", "/items/", "/items/secret-name.html"):
+                        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                        connection.request("GET", path)
+                        response = connection.getresponse()
+                        statuses[path] = (response.status, response.read())
+                        connection.close()
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                self.assertEqual(statuses["/"], (200, b"home"))
+                self.assertEqual(statuses["/items/"][0], 404)
+                self.assertNotIn(b"secret-name", statuses["/items/"][1])
+                self.assertEqual(statuses["/items/secret-name.html"][0], 200)
+
+
 class AccessLogCliTests(unittest.TestCase):
     def test_unwritable_access_log_is_structured(self):
         with tempfile.TemporaryDirectory() as temporary:

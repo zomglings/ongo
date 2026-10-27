@@ -187,6 +187,9 @@ class SetupAndSiteTests(unittest.TestCase):
         with mock.patch.object(site, "vendor_katex", return_value=False), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(site.build(Args), 0)
         self.assertNotIn("Private evidence", (self.root / "site" / "index.html").read_text())
+        build_log = (self.root / "site" / "build.log").read_text(encoding="utf-8")
+        self.assertTrue(build_log.startswith("ongo public static build\n"))
+        self.assertNotIn(str(self.root), build_log)
 
         client.command(
             "add", "ongo-web", "-k", note_id, "--title", "Reviewed evidence"
