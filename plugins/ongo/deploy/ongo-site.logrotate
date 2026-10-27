@@ -1,0 +1,16 @@
+# logrotate policy for the `ongo site serve --access-log` file.
+# Install: sudo cp ongo-site.logrotate /etc/logrotate.d/ongo-site
+# Keeps a year of weekly, compressed access logs. The server reopens the file
+# by itself after it is moved, so no copytruncate or restart is needed.
+# Replace `ongo` with the service user if you changed User= in the unit.
+
+/var/log/ongo/access.log {
+    weekly
+    rotate 52
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 ongo ongo
+    su ongo ongo
+}

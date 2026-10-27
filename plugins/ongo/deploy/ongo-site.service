@@ -25,7 +25,11 @@ Group=ongo
 # Use a stable plugin release; Claude's versioned cache is not a service path.
 Environment=ONGO_DATA_DIR=/var/lib/ongo
 ExecStart=/opt/ongo/bin/ongo site serve \
-    --dir /opt/ongo/site --host 0.0.0.0 --port 80
+    --dir /opt/ongo/site --host 0.0.0.0 --port 80 \
+    --access-log /var/log/ongo/access.log
+# Creates /var/log/ongo owned by User= and keeps it writable under
+# ProtectSystem=strict. Rotate it with deploy/ongo-site.logrotate.
+LogsDirectory=ongo
 WorkingDirectory=/opt/ongo
 Restart=on-failure
 RestartSec=5
