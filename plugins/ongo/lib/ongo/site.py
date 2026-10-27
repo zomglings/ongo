@@ -34,7 +34,7 @@ The generator:
 Public-only builds are stdlib-only and deterministic. Mixed-access builds use
 the plugin-pinned cryptography package and fresh AES-GCM nonces. Both are safe
 to run every self-improvement cycle: they rewrite the output directory cleanly.
-KaTeX vendoring degrades gracefully (raw math, logged to build.log) and never
+KaTeX vendoring degrades gracefully (raw math, logged to stdout) and never
 crashes the build.
 
 Usage:
@@ -2270,7 +2270,8 @@ def _build_into(args, out_dir, work_dir, old_dir):
     if os.path.isdir(katex_scratch):
         shutil.rmtree(katex_scratch, ignore_errors=True)
 
-    # Build log (also written into the site dir for auditability).
+    # Build log. The full log (paths, unresolved marker keys) goes to stdout
+    # only; the site dir gets a summary, as in mixed-access builds.
     log.append(f"published items: {len(items)}")
     log.append("index: single global reverse-chron flat list")
     log.append(f"katex: {'vendored' if katex_ok else 'unavailable (raw)'}")
@@ -2282,10 +2283,17 @@ def _build_into(args, out_dir, work_dir, old_dir):
     qa_clean, qa_total, qa_defects, qa_pass = run_qa(work_dir, log)
 
     log_text = "\n".join(log) + "\n"
+    public_log = (
+        "ongo public static build\n"
+        f"published items: {len(items)}\n"
+        f"katex: {'vendored' if katex_ok else 'unavailable (raw)'}\n"
+        f"qa: {'PASS' if qa_pass else 'FAIL'} ({qa_clean}/{qa_total} pages clean, "
+        f"{qa_defects} defects)\n"
+    )
     with open(
         os.path.join(work_dir, "build.log"), "w", encoding="utf-8"
     ) as fh:
-        fh.write(log_text)
+        fh.write(public_log)
 
     # --- staged replacement with rollback ------------------------------ #
     from .sealed import install_tree

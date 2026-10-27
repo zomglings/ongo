@@ -62,7 +62,11 @@ resolved from (in order) a filesystem `.md`/`.pdf`/`.tex` named by the
 publication key, a slug match under the note roots, the kendb note body via
 `ken show --json` (the supported **Ken v3** read path), or finally the title.
 Unresolvable references are skipped with a
-warning in `site/build.log` (the build never crashes). Cross-links between published
+warning in the build's stdout (the build never crashes). The published
+`site/build.log` holds only a summary (item count, KaTeX, QA result), so local
+paths and unresolved marker keys stay off the public site, and `ongo site
+serve` returns 404 for directories that have no `index.html` instead of
+listing their files. Cross-links between published
 notes resolve to their generated pages; links to **unpublished** notes
 degrade to plain text so unpublished content is never leaked.
 Presentation-oriented raw HTML is sanitized through a shared allowlist in
